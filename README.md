@@ -55,4 +55,18 @@ Production is deployed via Dokploy on OVH server (139.99.9.132).
 
 ## Backups
 
-Daily backups to MinIO (minio-api.hieunguyen.dev) bucket: `erpnext-backups`
+Daily automated backups run at 2 AM UTC via Dokploy scheduled task.
+
+**Backup location:** `/home/frappe/frappe-bench/sites/erp.soundboxstore.com/private/backups/`
+
+**Manual backup:**
+```bash
+docker exec code-backend-1 bench --site erp.soundboxstore.com backup --with-files
+```
+
+**MinIO bucket:** `erpnext-backups` at minio-api.hieunguyen.dev
+
+## Credentials
+
+- **Admin user:** Administrator
+- **Admin password:** (stored in Dokploy env vars)
