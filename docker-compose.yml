@@ -1,17 +1,18 @@
-x-depends-on-configurator: &depends_on_configurator
+x-backend-defaults: &backend_defaults
+  image: frappe/erpnext:${ERPNEXT_VERSION:-v15}
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
   depends_on:
     configurator:
       condition: service_completed_successfully
 
-x-backend-defaults: &backend_defaults
-  image: frappe/erpnext:${ERPNEXT_VERSION:-v15.46.3}
-  volumes:
-    - sites:/home/frappe/frappe-bench/sites
-    - logs:/home/frappe/frappe-bench/logs
-
 services:
   configurator:
-    <<: *backend_defaults
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
     entrypoint:
       - bash
       - -c
@@ -33,12 +34,10 @@ services:
 
   backend:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     restart: unless-stopped
 
   frontend:
-    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.46.3}
-    <<: *depends_on_configurator
+    <<: *backend_defaults
     restart: unless-stopped
     command:
       - nginx-entrypoint.sh
@@ -51,14 +50,11 @@ services:
       UPSTREAM_REAL_IP_RECURSIVE: "off"
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
-    volumes:
-      - sites:/home/frappe/frappe-bench/sites
     ports:
       - "${HTTP_PUBLISH_PORT:-8080}:8080"
 
   websocket:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     restart: unless-stopped
     command:
       - node
@@ -66,7 +62,6 @@ services:
 
   queue-short:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     restart: unless-stopped
     command:
       - bench
@@ -76,7 +71,6 @@ services:
 
   queue-long:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     restart: unless-stopped
     command:
       - bench
@@ -86,7 +80,6 @@ services:
 
   scheduler:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     restart: unless-stopped
     command:
       - bench
@@ -121,7 +114,6 @@ services:
 
   create-site:
     <<: *backend_defaults
-    <<: *depends_on_configurator
     entrypoint:
       - bash
       - -c
