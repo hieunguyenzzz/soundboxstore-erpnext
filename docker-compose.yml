@@ -1,0 +1,154 @@
+x-depends-on-configurator: &depends_on_configurator
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+x-backend-defaults: &backend_defaults
+  image: frappe/erpnext:${ERPNEXT_VERSION:-v15.46.3}
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+
+services:
+  configurator:
+    <<: *backend_defaults
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host $$DB_HOST;
+        bench set-config -gp db_port $$DB_PORT;
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+        bench set-config -gp socketio_port $$SOCKETIO_PORT;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+
+  backend:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    restart: unless-stopped
+
+  frontend:
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v15.46.3}
+    <<: *depends_on_configurator
+    restart: unless-stopped
+    command:
+      - nginx-entrypoint.sh
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME:-erp.soundboxstore.com}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    ports:
+      - "${HTTP_PUBLISH_PORT:-8080}:8080"
+
+  websocket:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    restart: unless-stopped
+    command:
+      - node
+      - /home/frappe/frappe-bench/apps/frappe/socketio.js
+
+  queue-short:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    restart: unless-stopped
+    command:
+      - bench
+      - worker
+      - --queue
+      - short,default
+
+  queue-long:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    restart: unless-stopped
+    command:
+      - bench
+      - worker
+      - --queue
+      - long
+
+  scheduler:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    restart: unless-stopped
+    command:
+      - bench
+      - schedule
+
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: mysqladmin ping -h localhost --password=${DB_PASSWORD}
+      interval: 1s
+      retries: 20
+
+  redis-cache:
+    image: redis:alpine
+    restart: unless-stopped
+
+  redis-queue:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  create-site:
+    <<: *backend_defaults
+    <<: *depends_on_configurator
+    entrypoint:
+      - bash
+      - -c
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        bench new-site --no-mariadb-socket --admin-password=${ADMIN_PASSWORD} --db-root-password=${DB_PASSWORD} --install-app erpnext --set-default ${SITE_NAME};
+    profiles:
+      - setup
+
+volumes:
+  db-data:
+  redis-queue-data:
+  sites:
+  logs:
