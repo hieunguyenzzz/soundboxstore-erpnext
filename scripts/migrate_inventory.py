@@ -145,6 +145,74 @@ class ERPNextClient:
                 return None
         return None
 
+    def get_items_batch(self, item_codes, batch_size=100):
+        """Fetch multiple items in batches and return a dict of {item_code: item_data}"""
+        all_items = {}
+
+        for i in range(0, len(item_codes), batch_size):
+            batch = item_codes[i:i + batch_size]
+            filters = json.dumps([['name', 'in', batch]])
+            fields = json.dumps(['name', 'valuation_rate', 'standard_rate'])
+
+            response = self.session.get(
+                f'{self.url}/api/resource/Item',
+                params={
+                    'filters': filters,
+                    'fields': fields,
+                    'limit_page_length': batch_size
+                },
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if response.status_code == 200:
+                try:
+                    items = response.json().get('data', [])
+                    for item in items:
+                        all_items[item['name']] = item
+                except json.JSONDecodeError:
+                    pass
+
+        return all_items
+
+    def get_existing_stock_entries(self, posting_date, entry_type='Material Receipt'):
+        """Get existing Stock Entries for a date to prevent duplicates.
+        Returns a set of warehouse names that already have entries."""
+        filters = json.dumps([
+            ['stock_entry_type', '=', entry_type],
+            ['posting_date', '=', posting_date],
+            ['docstatus', '!=', 2]  # Exclude cancelled
+        ])
+
+        response = self.session.get(
+            f'{self.url}/api/resource/Stock Entry',
+            params={
+                'filters': filters,
+                'fields': json.dumps(['name']),
+                'limit_page_length': 500
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        existing_warehouses = set()
+        if response.status_code == 200:
+            try:
+                entries = response.json().get('data', [])
+                # For each entry, get the warehouses used
+                for entry in entries:
+                    entry_detail = self.session.get(
+                        f'{self.url}/api/resource/Stock Entry/{entry["name"]}',
+                        timeout=REQUEST_TIMEOUT
+                    )
+                    if entry_detail.status_code == 200:
+                        items = entry_detail.json().get('data', {}).get('items', [])
+                        for item in items:
+                            if item.get('t_warehouse'):
+                                existing_warehouses.add(item['t_warehouse'])
+            except json.JSONDecodeError:
+                pass
+
+        return existing_warehouses
+
     def warehouse_exists(self, warehouse_name):
         """Check if warehouse exists"""
         response = self.session.get(
@@ -460,33 +528,53 @@ def create_stock_entries(client, inventory, batch_size=100):
     """Create Stock Entries grouped by warehouse
 
     Creates one Stock Entry per warehouse with all items for that warehouse.
+    Skips warehouses that already have Stock Entries for the posting date.
     """
     results = {
         'entries_created': 0,
         'entries_submitted': 0,
+        'entries_skipped': 0,
         'total_items': 0,
         'items_failed': 0,
         'items_missing': [],
         'errors': []
     }
 
+    posting_date = datetime.now().strftime('%Y-%m-%d')
+
+    # Check for existing Stock Entries to prevent duplicates
+    print('   Checking for existing Stock Entries...')
+    existing_warehouses = client.get_existing_stock_entries(posting_date)
+    if existing_warehouses:
+        print(f'   Found {len(existing_warehouses)} warehouses with existing entries (will skip)')
+
     # Group items by warehouse
     by_warehouse = defaultdict(list)
     for item in inventory:
         by_warehouse[item['warehouse']].append(item)
 
-    posting_date = datetime.now().strftime('%Y-%m-%d')
     total_warehouses = len(by_warehouse)
+
+    # Pre-fetch all item valuation rates in batches (performance optimization)
+    print('   Pre-fetching item valuation rates...')
+    all_item_codes = list(set(item['item_code'] for item in inventory))
+    item_data_map = client.get_items_batch(all_item_codes)
+    print(f'   Fetched {len(item_data_map)} items')
 
     for wh_idx, (warehouse, items) in enumerate(sorted(by_warehouse.items()), 1):
         print(f'\n[{wh_idx}/{total_warehouses}] Processing warehouse: {warehouse}')
         print(f'   Items to process: {len(items)}')
 
-        # Prepare items with valuation rates
+        # Skip if warehouse already has Stock Entry for this date
+        if warehouse in existing_warehouses:
+            print(f'   SKIPPED: Stock Entry already exists for {posting_date}')
+            results['entries_skipped'] += 1
+            continue
+
+        # Prepare items with valuation rates (using pre-fetched data)
         stock_items = []
         for item in items:
-            # Get valuation rate from Item master
-            item_data = client.get_item(item['item_code'])
+            item_data = item_data_map.get(item['item_code'])
             if not item_data:
                 results['items_missing'].append(item['item_code'])
                 results['items_failed'] += 1
@@ -542,7 +630,7 @@ def create_stock_entries(client, inventory, batch_size=100):
                         error = submit_response.get('error', 'Unknown error')
                         print(f'   WARNING: Created but failed to submit: {error}')
                 else:
-                    error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
+                    error = response.get('exception') or response.get('message') or response.get('error') or 'Unknown error'
                     results['errors'].append({
                         'warehouse': warehouse,
                         'error': str(error)[:200]
@@ -635,6 +723,7 @@ def main():
     print('=' * 60)
     print(f'Stock Entries Created:   {results["entries_created"]}')
     print(f'Stock Entries Submitted: {results["entries_submitted"]}')
+    print(f'Stock Entries Skipped:   {results["entries_skipped"]} (already exist)')
     print(f'Total Items Imported:    {results["total_items"]}')
     print(f'Items Failed:            {results["items_failed"]}')
 
@@ -661,6 +750,7 @@ def main():
             'warehouse_results': wh_results,
             'entries_created': results['entries_created'],
             'entries_submitted': results['entries_submitted'],
+            'entries_skipped': results['entries_skipped'],
             'total_items_imported': results['total_items'],
             'items_failed': results['items_failed'],
             'items_missing': results['items_missing'],
