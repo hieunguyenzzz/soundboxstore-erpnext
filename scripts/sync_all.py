@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-SBS-51: Master Sync Script
+Master Sync Script
 Runs all data migrations in the correct order.
 
 This script orchestrates:
-1. migrate_master_data.py - Products/Items
-2. migrate_customers.py - Customers
-3. migrate_containers.py - Shipping Containers
+1. migrate_master_data.py - Products/Items (SBS-51)
+2. migrate_customers.py - Customers (SBS-51)
+3. migrate_containers.py - Shipping Containers (SBS-51)
+4. migrate_inventory.py - Opening Stock (SBS-52)
 
 Environment Variables (same as individual scripts):
   ERPNEXT_URL          - ERPNext server URL (required)
@@ -29,18 +30,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 def main():
     """Run all migrations in order"""
     print('=' * 70)
-    print('SBS-51: FULL DATA SYNC')
+    print('FULL DATA SYNC')
     print('=' * 70)
     print('\nThis will run all migrations in order:')
     print('  1. Products/Items (migrate_master_data.py)')
     print('  2. Customers (migrate_customers.py)')
     print('  3. Containers (migrate_containers.py)')
+    print('  4. Inventory (migrate_inventory.py)')
     print('')
 
     results = {
         'products': None,
         'customers': None,
-        'containers': None
+        'containers': None,
+        'inventory': None
     }
 
     # 1. Products/Items
@@ -84,6 +87,20 @@ def main():
     except Exception as e:
         print(f'ERROR in containers migration: {e}')
         results['containers'] = 'failed'
+
+    # 4. Inventory (Opening Stock)
+    print('\n' + '=' * 70)
+    print('PHASE 4: INVENTORY (OPENING STOCK)')
+    print('=' * 70)
+    try:
+        from migrate_inventory import main as sync_inventory
+        sync_inventory()
+        results['inventory'] = 'success'
+    except SystemExit as e:
+        results['inventory'] = 'failed' if e.code != 0 else 'success'
+    except Exception as e:
+        print(f'ERROR in inventory migration: {e}')
+        results['inventory'] = 'failed'
 
     # Summary
     print('\n' + '=' * 70)
