@@ -2,28 +2,60 @@
 """
 SBS-51: Customer Migration Script
 Imports customers from Google Sheets Despatched sheet into ERPNext
+
+Environment Variables:
+  ERPNEXT_URL          - ERPNext server URL (required)
+  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
+  ERPNEXT_PASSWORD     - ERPNext password (required)
+  GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
+  SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
 """
 
 import os
 import re
 import json
 import time
+import sys
 import requests
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# Configuration
-GOOGLE_SHEETS_CONFIG = {
-    'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
-    'service_account_file': os.path.expanduser('~/.config/gcloud/service-accounts/sheets-api-service.json'),
-    'spreadsheet_id': '1NQA7DBzIryCjA0o0dxehLyGmxM8ZeOofpg3IENgtDmA',
-}
 
-ERPNEXT_CONFIG = {
-    'url': os.environ.get('ERPNEXT_URL', 'http://100.65.0.28:8080'),
-    'username': 'Administrator',
-    'password': os.environ.get('ERPNEXT_PASSWORD', 'soundbox-admin-2026'),
-}
+def get_config():
+    """Load configuration from environment variables"""
+    config = {
+        'erpnext': {
+            'url': os.environ.get('ERPNEXT_URL'),
+            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
+            'password': os.environ.get('ERPNEXT_PASSWORD'),
+        },
+        'google_sheets': {
+            'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
+            'credentials': os.environ.get('GOOGLE_SHEETS_CREDS'),
+            'spreadsheet_id': os.environ.get('SPREADSHEET_ID', '1NQA7DBzIryCjA0o0dxehLyGmxM8ZeOofpg3IENgtDmA'),
+        }
+    }
+
+    missing = []
+    if not config['erpnext']['url']:
+        missing.append('ERPNEXT_URL')
+    if not config['erpnext']['password']:
+        missing.append('ERPNEXT_PASSWORD')
+    if not config['google_sheets']['credentials']:
+        missing.append('GOOGLE_SHEETS_CREDS')
+
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+        print("\nRequired environment variables:")
+        print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
+        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
+        print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
+        print("\nOptional:")
+        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
+        print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
+        sys.exit(1)
+
+    return config
 
 
 class ERPNextClient:
@@ -62,17 +94,6 @@ class ERPNextClient:
         )
         return response.json()
 
-    def get_customer(self, customer_name):
-        """Get a Customer by name"""
-        # URL encode the customer name
-        encoded_name = requests.utils.quote(customer_name, safe='')
-        response = self.session.get(
-            f'{self.url}/api/resource/Customer/{encoded_name}'
-        )
-        if response.status_code == 200:
-            return response.json().get('data')
-        return None
-
     def customer_exists(self, customer_name):
         """Check if customer exists by name"""
         response = self.session.get(
@@ -85,12 +106,27 @@ class ERPNextClient:
         return False
 
 
-def get_sheets_service():
+def get_sheets_service(config):
     """Initialize Google Sheets API service"""
-    creds = Credentials.from_service_account_file(
-        GOOGLE_SHEETS_CONFIG['service_account_file'],
-        scopes=GOOGLE_SHEETS_CONFIG['scopes']
-    )
+    creds_input = config['google_sheets']['credentials']
+
+    if os.path.isfile(creds_input):
+        creds = Credentials.from_service_account_file(
+            creds_input,
+            scopes=config['google_sheets']['scopes']
+        )
+    else:
+        try:
+            creds_info = json.loads(creds_input)
+            creds = Credentials.from_service_account_info(
+                creds_info,
+                scopes=config['google_sheets']['scopes']
+            )
+        except json.JSONDecodeError:
+            raise ValueError(
+                "GOOGLE_SHEETS_CREDS must be either a valid file path or JSON content"
+            )
+
     return build('sheets', 'v4', credentials=creds)
 
 
@@ -105,34 +141,30 @@ def clean_phone(value):
     """Clean phone number"""
     if not value:
         return ''
-    # Remove common prefixes and clean
     cleaned = re.sub(r'[^\d+]', '', str(value))
     return cleaned if cleaned else ''
 
 
-def read_customers(service):
+def read_customers(service, spreadsheet_id):
     """Read and parse unique customers from Despatched sheet"""
     result = service.spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEETS_CONFIG['spreadsheet_id'],
-        range='Despatched!A2:N10000'  # Skip header row
+        spreadsheetId=spreadsheet_id,
+        range='Despatched!A2:N10000'
     ).execute()
 
     rows = result.get('values', [])
-    customers = {}  # Use dict to dedupe by email
+    customers = {}
 
     for row in rows:
-        # Safe column access
         def get_col(idx):
             return row[idx] if idx < len(row) else ''
 
-        email = clean_text(get_col(8)).lower()  # Customer Email
-        name = clean_text(get_col(7))  # Customer Name
+        email = clean_text(get_col(8)).lower()
+        name = clean_text(get_col(7))
 
-        # Skip if no email or name
         if not email or not name:
             continue
 
-        # Skip if already processed this email
         if email in customers:
             continue
 
@@ -164,13 +196,11 @@ def import_customers(client, customers, batch_size=50):
 
     for i, cust in enumerate(customers):
         try:
-            # Check if customer exists
             if client.customer_exists(cust['customer_name']):
                 print(f'[{i+1}/{total}] Skipping (exists): {cust["customer_name"]}')
                 results['skipped'] += 1
                 continue
 
-            # Create customer
             customer_data = {
                 'customer_name': cust['customer_name'],
                 'customer_type': 'Company' if any(x in cust['customer_name'].lower() for x in ['ltd', 'limited', 'inc', 'plc', 'llc', 'corp', 'academy', 'school', 'university', 'college', 'council']) else 'Individual',
@@ -183,7 +213,6 @@ def import_customers(client, customers, batch_size=50):
             if response.get('data', {}).get('name'):
                 customer_id = response['data']['name']
 
-                # Create address if we have address data
                 if cust['address'] or cust['city']:
                     address_data = {
                         'address_title': cust['customer_name'],
@@ -217,7 +246,6 @@ def import_customers(client, customers, batch_size=50):
             })
             print(f'[{i+1}/{total}] Error: {cust["customer_name"]} - {str(e)[:80]}')
 
-        # Rate limiting
         if (i + 1) % batch_size == 0:
             print(f'Processed {i+1}/{total} customers, pausing...')
             time.sleep(1)
@@ -231,27 +259,28 @@ def main():
     print('SBS-51: Customer Migration')
     print('=' * 60)
 
-    # Initialize services
+    config = get_config()
+
     print('\n1. Connecting to Google Sheets...')
-    sheets_service = get_sheets_service()
+    sheets_service = get_sheets_service(config)
 
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
-        ERPNEXT_CONFIG['url'],
-        ERPNEXT_CONFIG['username'],
-        ERPNEXT_CONFIG['password']
+        config['erpnext']['url'],
+        config['erpnext']['username'],
+        config['erpnext']['password']
     )
 
-    # Read data
     print('\n3. Reading customers from Despatched sheet...')
-    customers = read_customers(sheets_service)
+    customers = read_customers(
+        sheets_service,
+        config['google_sheets']['spreadsheet_id']
+    )
     print(f'   Found {len(customers)} unique customers')
 
-    # Import customers
     print(f'\n4. Importing {len(customers)} customers to ERPNext...')
     results = import_customers(erpnext, customers)
 
-    # Summary
     print('\n' + '=' * 60)
     print('CUSTOMER MIGRATION COMPLETE')
     print('=' * 60)
@@ -264,7 +293,6 @@ def main():
         for err in results['errors'][:10]:
             print(f'  - {err["customer"]}: {err["error"][:60]}')
 
-    # Save detailed report
     report_path = '/tmp/customer_migration_report.json'
     with open(report_path, 'w') as f:
         json.dump({
@@ -275,6 +303,8 @@ def main():
             'errors': results['errors']
         }, f, indent=2)
     print(f'\nDetailed report saved to: {report_path}')
+
+    sys.exit(1 if results['failed'] > 0 else 0)
 
 
 if __name__ == '__main__':
