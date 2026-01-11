@@ -50,8 +50,6 @@ services:
       UPSTREAM_REAL_IP_RECURSIVE: "off"
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
-    ports:
-      - "${HTTP_PUBLISH_PORT:-8080}:8080"
 
   websocket:
     <<: *backend_defaults
