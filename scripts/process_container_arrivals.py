@@ -230,7 +230,7 @@ class ERPNextClient:
             return response.json()
         return {'error': f'HTTP {response.status_code}'}
 
-    def create_stock_transfer(self, items, source_warehouse, target_warehouse, posting_date):
+    def create_stock_transfer(self, items, source_warehouse, target_warehouse, posting_date, remarks=None):
         """Create a Stock Entry (Material Transfer)"""
         stock_items = []
         for item in items:
@@ -248,6 +248,9 @@ class ERPNextClient:
             'company': COMPANY,
             'items': stock_items
         }
+
+        if remarks:
+            data['remarks'] = remarks
 
         response = self.session.post(
             f'{self.url}/api/resource/Stock Entry',
@@ -293,27 +296,55 @@ class ERPNextClient:
 
         return {'error': f'Submit failed: {response.text[:200]}'}
 
+    def has_existing_transfer(self, container_name, posting_date):
+        """Check if a stock transfer already exists for this container on this date"""
+        # Search for Stock Entries with matching remarks
+        filters = json.dumps([
+            ['posting_date', '=', posting_date],
+            ['stock_entry_type', '=', 'Material Transfer'],
+            ['docstatus', '=', 1],  # Submitted only
+            ['remarks', 'like', f'%Container Arrival: {container_name}%']
+        ])
+
+        response = self.session.get(
+            f'{self.url}/api/resource/Stock Entry',
+            params={
+                'filters': filters,
+                'fields': json.dumps(['name', 'posting_date', 'remarks']),
+                'limit_page_length': 1
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+
+        if response.status_code == 200:
+            try:
+                data = response.json().get('data', [])
+                return len(data) > 0
+            except json.JSONDecodeError:
+                pass
+        return False
+
 
 def get_sheets_service(config):
     """Initialize Google Sheets API service"""
     creds_input = config['google_sheets']['credentials']
 
     if os.path.exists(os.path.expanduser(creds_input)):
-        creds_path = os.path.expanduser(creds_input)
+        # File path provided
+        creds = Credentials.from_service_account_file(
+            os.path.expanduser(creds_input),
+            scopes=config['google_sheets']['scopes']
+        )
     else:
+        # JSON content provided directly
         try:
             creds_data = json.loads(creds_input)
-            temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-            json.dump(creds_data, temp_file)
-            temp_file.close()
-            creds_path = temp_file.name
+            creds = Credentials.from_service_account_info(
+                creds_data,
+                scopes=config['google_sheets']['scopes']
+            )
         except json.JSONDecodeError:
             raise Exception("GOOGLE_SHEETS_CREDS must be a valid file path or JSON content")
-
-    creds = Credentials.from_service_account_file(
-        creds_path,
-        scopes=config['google_sheets']['scopes']
-    )
 
     return build('sheets', 'v4', credentials=creds)
 
@@ -450,6 +481,14 @@ def process_container(client, container_name, items, container_info, posting_dat
         'error': None
     }
 
+    # Check for duplicate transfer (prevents re-processing on same day)
+    if client.has_existing_transfer(container_name, posting_date):
+        result['status'] = 'skipped'
+        result['warnings'].append(f'Transfer already exists for {posting_date}')
+        print(f'\n   Container: {container_name}')
+        print(f'   ⏭️ SKIPPED: Transfer already exists for this date')
+        return result
+
     # Resolve destination warehouse
     destination = resolve_warehouse(container_info)
     result['destination'] = destination
@@ -501,12 +540,14 @@ def process_container(client, container_name, items, container_info, posting_dat
 
     print(f'   Transferring {len(valid_items)} items...')
 
-    # Create Stock Transfer
+    # Create Stock Transfer with remarks for duplicate detection
+    remarks = f"Container Arrival: {container_name} | ETA: {items[0]['eta'] if items else 'N/A'}"
     transfer_result = client.create_stock_transfer(
         valid_items,
         SOURCE_WAREHOUSE,
         destination,
-        posting_date
+        posting_date,
+        remarks=remarks
     )
 
     if transfer_result.get('error'):
