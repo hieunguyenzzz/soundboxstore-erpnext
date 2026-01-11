@@ -8,6 +8,7 @@ This script orchestrates:
 2. migrate_customers.py - Customers (SBS-51)
 3. migrate_containers.py - Shipping Containers (SBS-51)
 4. migrate_inventory.py - Opening Stock (SBS-52)
+5. process_container_arrivals.py - Container Arrivals (SBS-59)
 
 Environment Variables (same as individual scripts):
   ERPNEXT_URL          - ERPNext server URL (required)
@@ -15,6 +16,8 @@ Environment Variables (same as individual scripts):
   ERPNEXT_PASSWORD     - ERPNext password (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
+  TELEGRAM_BOT_TOKEN   - Telegram bot token for notifications (optional)
+  TELEGRAM_CHAT_ID     - Telegram chat ID for notifications (optional)
 
 Usage:
   python scripts/sync_all.py
@@ -37,13 +40,15 @@ def main():
     print('  2. Customers (migrate_customers.py)')
     print('  3. Containers (migrate_containers.py)')
     print('  4. Inventory (migrate_inventory.py)')
+    print('  5. Container Arrivals (process_container_arrivals.py)')
     print('')
 
     results = {
         'products': None,
         'customers': None,
         'containers': None,
-        'inventory': None
+        'inventory': None,
+        'arrivals': None
     }
 
     # 1. Products/Items
@@ -101,6 +106,20 @@ def main():
     except Exception as e:
         print(f'ERROR in inventory migration: {e}')
         results['inventory'] = 'failed'
+
+    # 5. Container Arrivals
+    print('\n' + '=' * 70)
+    print('PHASE 5: CONTAINER ARRIVALS')
+    print('=' * 70)
+    try:
+        from process_container_arrivals import main as process_arrivals
+        process_arrivals()
+        results['arrivals'] = 'success'
+    except SystemExit as e:
+        results['arrivals'] = 'failed' if e.code != 0 else 'success'
+    except Exception as e:
+        print(f'ERROR in container arrivals: {e}')
+        results['arrivals'] = 'failed'
 
     # Summary
     print('\n' + '=' * 70)
