@@ -55,8 +55,6 @@ Production is deployed via Dokploy on OVH server (139.99.9.132).
 
 ## Backups
 
-Daily automated backups run at 2 AM UTC via Dokploy scheduled task.
-
 **Backup location:** `/home/frappe/frappe-bench/sites/erp.soundboxstore.com/private/backups/`
 
 **Manual backup:**
@@ -64,7 +62,7 @@ Daily automated backups run at 2 AM UTC via Dokploy scheduled task.
 docker exec code-backend-1 bench --site erp.soundboxstore.com backup --with-files
 ```
 
-**MinIO bucket:** `erpnext-backups` at minio-api.hieunguyen.dev
+**MinIO bucket:** `erpnext-backups` at minio-api.hieunguyen.dev (for future use)
 
 ## Credentials
 
