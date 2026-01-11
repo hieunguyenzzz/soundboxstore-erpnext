@@ -162,8 +162,8 @@ class ERPNextClient:
         except json.JSONDecodeError:
             return {'error': 'Invalid JSON response'}
 
-    def customer_exists(self, customer_name):
-        """Check if customer exists by name"""
+    def get_customer(self, customer_name):
+        """Get customer by name, returns customer name (ID) if exists, None otherwise"""
         response = self.session.get(
             f'{self.url}/api/resource/Customer',
             params={'filters': json.dumps([['customer_name', '=', customer_name]])},
@@ -172,10 +172,26 @@ class ERPNextClient:
         if response.status_code == 200:
             try:
                 data = response.json().get('data', [])
-                return len(data) > 0
+                if data:
+                    return data[0].get('name')
             except json.JSONDecodeError:
-                return False
-        return False
+                return None
+        return None
+
+    def update_customer(self, customer_id, data):
+        """Update an existing Customer in ERPNext"""
+        response = self.session.put(
+            f'{self.url}/api/resource/Customer/{customer_id}',
+            json=data,
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
 
 
 def get_sheets_service(config):
@@ -262,10 +278,10 @@ def read_customers(service, spreadsheet_id):
 
 
 def import_customers(client, customers, batch_size=50):
-    """Import customers into ERPNext"""
+    """Import customers into ERPNext using upsert (update if exists, create if not)"""
     results = {
         'created': 0,
-        'skipped': 0,
+        'updated': 0,
         'failed': 0,
         'errors': []
     }
@@ -274,11 +290,6 @@ def import_customers(client, customers, batch_size=50):
 
     for i, cust in enumerate(customers):
         try:
-            if client.customer_exists(cust['customer_name']):
-                print(f'[{i+1}/{total}] Skipping (exists): {cust["customer_name"]}')
-                results['skipped'] += 1
-                continue
-
             # Use word boundary matching for company detection
             customer_type = 'Company' if is_company(cust['customer_name']) else 'Individual'
 
@@ -289,35 +300,53 @@ def import_customers(client, customers, batch_size=50):
                 'territory': 'All Territories',
             }
 
-            response = client.create_customer(customer_data)
+            existing_id = client.get_customer(cust['customer_name'])
 
-            if response.get('data', {}).get('name'):
-                customer_id = response['data']['name']
-
-                if cust['address'] or cust['city']:
-                    address_data = {
-                        'address_title': cust['customer_name'],
-                        'address_type': 'Billing',
-                        'address_line1': cust['address'] or cust['city'],
-                        'city': cust['city'] or 'Not specified',
-                        'pincode': cust['pincode'],
-                        'country': cust['country'],
-                        'phone': cust['phone'],
-                        'email_id': cust['email'],
-                        'links': [{'link_doctype': 'Customer', 'link_name': customer_id}]
-                    }
-                    client.create_address(address_data)
-
-                results['created'] += 1
-                print(f'[{i+1}/{total}] Created: {cust["customer_name"]} ({customer_type})')
+            if existing_id:
+                # Update existing customer
+                response = client.update_customer(existing_id, customer_data)
+                if response.get('data', {}).get('name'):
+                    results['updated'] += 1
+                    print(f'[{i+1}/{total}] Updated: {cust["customer_name"]} ({customer_type})')
+                else:
+                    error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
+                    results['failed'] += 1
+                    results['errors'].append({
+                        'customer': cust['customer_name'],
+                        'error': f'Update failed: {error}'
+                    })
+                    print(f'[{i+1}/{total}] Update failed: {cust["customer_name"]} - {str(error)[:80]}')
             else:
-                error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
-                results['failed'] += 1
-                results['errors'].append({
-                    'customer': cust['customer_name'],
-                    'error': error
-                })
-                print(f'[{i+1}/{total}] Failed: {cust["customer_name"]} - {str(error)[:80]}')
+                # Create new customer
+                response = client.create_customer(customer_data)
+
+                if response.get('data', {}).get('name'):
+                    customer_id = response['data']['name']
+
+                    if cust['address'] or cust['city']:
+                        address_data = {
+                            'address_title': cust['customer_name'],
+                            'address_type': 'Billing',
+                            'address_line1': cust['address'] or cust['city'],
+                            'city': cust['city'] or 'Not specified',
+                            'pincode': cust['pincode'],
+                            'country': cust['country'],
+                            'phone': cust['phone'],
+                            'email_id': cust['email'],
+                            'links': [{'link_doctype': 'Customer', 'link_name': customer_id}]
+                        }
+                        client.create_address(address_data)
+
+                    results['created'] += 1
+                    print(f'[{i+1}/{total}] Created: {cust["customer_name"]} ({customer_type})')
+                else:
+                    error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
+                    results['failed'] += 1
+                    results['errors'].append({
+                        'customer': cust['customer_name'],
+                        'error': f'Create failed: {error}'
+                    })
+                    print(f'[{i+1}/{total}] Create failed: {cust["customer_name"]} - {str(error)[:80]}')
 
         except requests.exceptions.Timeout:
             results['failed'] += 1
@@ -384,7 +413,7 @@ def main():
     print('CUSTOMER MIGRATION COMPLETE')
     print('=' * 60)
     print(f'Created: {results["created"]}')
-    print(f'Skipped: {results["skipped"]}')
+    print(f'Updated: {results["updated"]}')
     print(f'Failed:  {results["failed"]}')
 
     if results['errors']:
@@ -399,7 +428,7 @@ def main():
         json.dump({
             'total_customers': len(customers),
             'created': results['created'],
-            'skipped': results['skipped'],
+            'updated': results['updated'],
             'failed': results['failed'],
             'invalid_emails': invalid_emails[:50],
             'errors': results['errors']

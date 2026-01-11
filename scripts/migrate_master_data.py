@@ -134,6 +134,21 @@ class ERPNextClient:
                 return None
         return None
 
+    def update_item(self, item_code, data):
+        """Update an existing Item in ERPNext"""
+        response = self.session.put(
+            f'{self.url}/api/resource/Item/{item_code}',
+            json=data,
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
+
 
 def get_sheets_service(config):
     """Initialize Google Sheets API service"""
@@ -263,10 +278,10 @@ def read_masterfile(service, spreadsheet_id):
 
 
 def import_items(client, items, batch_size=50):
-    """Import items into ERPNext in batches"""
+    """Import items into ERPNext in batches using upsert (update if exists, create if not)"""
     results = {
         'created': 0,
-        'skipped': 0,
+        'updated': 0,
         'failed': 0,
         'errors': []
     }
@@ -278,24 +293,35 @@ def import_items(client, items, batch_size=50):
 
         try:
             existing = client.get_item(item['item_code'])
+
             if existing:
-                print(f'[{i+1}/{total}] Skipping (exists): {item["item_code"]}')
-                results['skipped'] += 1
-                continue
-
-            response = client.create_item(item)
-
-            if response.get('data', {}).get('name'):
-                results['created'] += 1
-                print(f'[{i+1}/{total}] Created: {item["item_code"]}')
+                # Update existing item
+                response = client.update_item(item['item_code'], item)
+                if response.get('data', {}).get('name'):
+                    results['updated'] += 1
+                    print(f'[{i+1}/{total}] Updated: {item["item_code"]}')
+                else:
+                    error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
+                    results['failed'] += 1
+                    results['errors'].append({
+                        'item_code': item['item_code'],
+                        'error': f'Update failed: {error}'
+                    })
+                    print(f'[{i+1}/{total}] Update failed: {item["item_code"]} - {str(error)[:100]}')
             else:
-                error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
-                results['failed'] += 1
-                results['errors'].append({
-                    'item_code': item['item_code'],
-                    'error': error
-                })
-                print(f'[{i+1}/{total}] Failed: {item["item_code"]} - {str(error)[:100]}')
+                # Create new item
+                response = client.create_item(item)
+                if response.get('data', {}).get('name'):
+                    results['created'] += 1
+                    print(f'[{i+1}/{total}] Created: {item["item_code"]}')
+                else:
+                    error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
+                    results['failed'] += 1
+                    results['errors'].append({
+                        'item_code': item['item_code'],
+                        'error': f'Create failed: {error}'
+                    })
+                    print(f'[{i+1}/{total}] Create failed: {item["item_code"]} - {str(error)[:100]}')
 
         except requests.exceptions.Timeout:
             results['failed'] += 1
@@ -362,7 +388,7 @@ def main():
     print('MIGRATION COMPLETE')
     print('=' * 60)
     print(f'Created: {results["created"]}')
-    print(f'Skipped: {results["skipped"]}')
+    print(f'Updated: {results["updated"]}')
     print(f'Failed:  {results["failed"]}')
 
     if results['errors']:
@@ -377,7 +403,7 @@ def main():
         json.dump({
             'total_items': len(items),
             'created': results['created'],
-            'skipped': results['skipped'],
+            'updated': results['updated'],
             'failed': results['failed'],
             'skipped_rows': skipped[:50],
             'errors': results['errors']
