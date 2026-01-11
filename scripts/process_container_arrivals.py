@@ -13,12 +13,14 @@ Data Flow:
 Warehouse Mapping:
 | LOCATION | Shipped to                       | Destination Warehouse          |
 |----------|----------------------------------|--------------------------------|
-| UK       | Marone Solutions Ltd             | STOCK IN WAREHOUSE - UK - MAR  |
-| UK       | Edward's Furniture Solutions Ltd | STOCK IN WAREHOUSE - UK - FSL  |
-| UK       | Primary OFS                      | STOCK IN WAREHOUSE - UK - PRIM |
-| UK       | Edward's                         | STOCK IN WAREHOUSE - UK - ED   |
-| SPAIN    | Transportes Grau                 | STOCK IN WAREHOUSE - ES - GRAU |
-| SPAIN    | (empty/default)                  | STOCK IN WAREHOUSE - ES        |
+| UK       | Marone Solutions Ltd             | Stock In Warehouse UK MAR      |
+| UK       | Final Step Logistics             | Stock In Warehouse UK FSL      |
+| UK       | Primary OFS                      | Stock In Warehouse UK PRIM     |
+| UK       | Edward's Furniture Solutions Ltd | Stock In Warehouse UK FSL      |
+| UK       | (empty/default)                  | Stock In Warehouse UK MAR      |
+| SPAIN    | PWH                              | Stock In Warehouse ES          |
+| SPAIN    | Transportes Grau                 | Stock In Warehouse ES          |
+| SPAIN    | (empty/default)                  | Stock In Warehouse ES          |
 
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
@@ -48,12 +50,16 @@ COMPANY = "Soundbox Store"
 SOURCE_WAREHOUSE = "Goods on Water - SBS"
 
 # Warehouse mapping: (LOCATION, Shipped to) -> ERPNext warehouse
+# Based on actual Container Status sheet data and ERPNext warehouses
 WAREHOUSE_MAPPING = {
+    # UK destinations
     ('UK', 'Marone Solutions Ltd'): 'Stock In Warehouse UK MAR - SBS',
-    ('UK', 'Edward\'s Furniture Solutions Ltd'): 'Stock In Warehouse UK FSL - SBS',
+    ('UK', 'Final Step Logistics'): 'Stock In Warehouse UK FSL - SBS',
     ('UK', 'Primary OFS'): 'Stock In Warehouse UK PRIM - SBS',
-    ('UK', 'Edward\'s'): 'Stock In Warehouse UK ED - SBS',
-    ('SPAIN', 'Transportes Grau'): 'Stock In Warehouse ES GRAU - SBS',
+    ('UK', 'Edward\'s Furniture Solutions Ltd'): 'Stock In Warehouse UK FSL - SBS',
+    # Spain destinations
+    ('SPAIN', 'PWH'): 'Stock In Warehouse ES - SBS',
+    ('SPAIN', 'Transportes Grau'): 'Stock In Warehouse ES - SBS',
     ('SPAIN', ''): 'Stock In Warehouse ES - SBS',
 }
 
