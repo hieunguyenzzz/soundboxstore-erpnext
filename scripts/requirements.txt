@@ -1,0 +1,12 @@
+# SBS-51: Migration Scripts Dependencies
+# Python 3.8+ required
+
+# HTTP requests with retry support
+requests>=2.28.0
+urllib3>=2.0.0
+
+# Google Sheets API
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1

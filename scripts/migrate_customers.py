@@ -16,9 +16,33 @@ import re
 import json
 import time
 import sys
+import tempfile
+from datetime import datetime
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
+# Constants
+REQUEST_TIMEOUT = 30  # seconds
+
+# Company keywords with word boundary matching
+COMPANY_KEYWORDS = [
+    r'\bltd\b', r'\blimited\b', r'\binc\b', r'\bplc\b', r'\bllc\b',
+    r'\bcorp\b', r'\bcorporation\b', r'\bacademy\b', r'\bschool\b',
+    r'\buniversity\b', r'\bcollege\b', r'\bcouncil\b', r'\bgmbh\b',
+    r'\bbv\b', r'\bab\b', r'\bsa\b', r'\bag\b', r'\bco\b', r'\bgroup\b',
+    r'\bholdings?\b', r'\bpartners?\b', r'\bassociates?\b', r'\bconsulting\b',
+    r'\bservices\b', r'\bsolutions\b', r'\benterprise\b', r'\bindustries\b',
+    r'\btrust\b', r'\bfoundation\b', r'\bcharity\b', r'\bnhs\b', r'\bhospital\b'
+]
+COMPANY_PATTERN = re.compile('|'.join(COMPANY_KEYWORDS), re.IGNORECASE)
+
+# Email validation pattern (RFC 5322 simplified)
+EMAIL_PATTERN = re.compile(
+    r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+)
 
 
 def get_config():
@@ -58,22 +82,54 @@ def get_config():
     return config
 
 
+def create_session_with_retry():
+    """Create a requests session with retry logic"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def is_valid_email(email):
+    """Validate email format"""
+    if not email:
+        return False
+    return bool(EMAIL_PATTERN.match(email))
+
+
+def is_company(name):
+    """Check if a name appears to be a company using word boundary matching"""
+    if not name:
+        return False
+    return bool(COMPANY_PATTERN.search(name))
+
+
 class ERPNextClient:
     """ERPNext API Client"""
 
     def __init__(self, url, username, password):
         self.url = url.rstrip('/')
-        self.session = requests.Session()
+        self.session = create_session_with_retry()
         self.login(username, password)
 
     def login(self, username, password):
         """Login and get session cookie"""
         response = self.session.post(
             f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password}
+            data={'usr': username, 'pwd': password},
+            timeout=REQUEST_TIMEOUT
         )
-        if response.status_code != 200 or 'Logged In' not in response.text:
-            raise Exception(f'Login failed: {response.text}')
+        if response.status_code != 200:
+            raise Exception(f'Login failed with status {response.status_code}')
+        if 'Logged In' not in response.text:
+            raise Exception('Login failed: Invalid credentials')
         print(f'Logged in to ERPNext at {self.url}')
 
     def create_customer(self, data):
@@ -81,28 +137,44 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Customer',
             json=data,
-            headers={'Content-Type': 'application/json'}
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
         )
-        return response.json()
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
 
     def create_address(self, data):
         """Create an Address in ERPNext"""
         response = self.session.post(
             f'{self.url}/api/resource/Address',
             json=data,
-            headers={'Content-Type': 'application/json'}
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
         )
-        return response.json()
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
 
     def customer_exists(self, customer_name):
         """Check if customer exists by name"""
         response = self.session.get(
             f'{self.url}/api/resource/Customer',
-            params={'filters': json.dumps([['customer_name', '=', customer_name]])}
+            params={'filters': json.dumps([['customer_name', '=', customer_name]])},
+            timeout=REQUEST_TIMEOUT
         )
         if response.status_code == 200:
-            data = response.json().get('data', [])
-            return len(data) > 0
+            try:
+                data = response.json().get('data', [])
+                return len(data) > 0
+            except json.JSONDecodeError:
+                return False
         return False
 
 
@@ -154,6 +226,7 @@ def read_customers(service, spreadsheet_id):
 
     rows = result.get('values', [])
     customers = {}
+    invalid_emails = []
 
     for row in rows:
         def get_col(idx):
@@ -163,6 +236,11 @@ def read_customers(service, spreadsheet_id):
         name = clean_text(get_col(7))
 
         if not email or not name:
+            continue
+
+        # Validate email format
+        if not is_valid_email(email):
+            invalid_emails.append({'email': email, 'name': name})
             continue
 
         if email in customers:
@@ -180,7 +258,7 @@ def read_customers(service, spreadsheet_id):
 
         customers[email] = customer
 
-    return list(customers.values())
+    return list(customers.values()), invalid_emails
 
 
 def import_customers(client, customers, batch_size=50):
@@ -201,9 +279,12 @@ def import_customers(client, customers, batch_size=50):
                 results['skipped'] += 1
                 continue
 
+            # Use word boundary matching for company detection
+            customer_type = 'Company' if is_company(cust['customer_name']) else 'Individual'
+
             customer_data = {
                 'customer_name': cust['customer_name'],
-                'customer_type': 'Company' if any(x in cust['customer_name'].lower() for x in ['ltd', 'limited', 'inc', 'plc', 'llc', 'corp', 'academy', 'school', 'university', 'college', 'council']) else 'Individual',
+                'customer_type': customer_type,
                 'customer_group': 'All Customer Groups',
                 'territory': 'All Territories',
             }
@@ -228,15 +309,31 @@ def import_customers(client, customers, batch_size=50):
                     client.create_address(address_data)
 
                 results['created'] += 1
-                print(f'[{i+1}/{total}] Created: {cust["customer_name"]}')
+                print(f'[{i+1}/{total}] Created: {cust["customer_name"]} ({customer_type})')
             else:
-                error = response.get('exception', response.get('message', str(response)))
+                error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
                 results['failed'] += 1
                 results['errors'].append({
                     'customer': cust['customer_name'],
                     'error': error
                 })
-                print(f'[{i+1}/{total}] Failed: {cust["customer_name"]} - {error[:80]}')
+                print(f'[{i+1}/{total}] Failed: {cust["customer_name"]} - {str(error)[:80]}')
+
+        except requests.exceptions.Timeout:
+            results['failed'] += 1
+            results['errors'].append({
+                'customer': cust['customer_name'],
+                'error': 'Request timeout'
+            })
+            print(f'[{i+1}/{total}] Timeout: {cust["customer_name"]}')
+
+        except requests.exceptions.RequestException as e:
+            results['failed'] += 1
+            results['errors'].append({
+                'customer': cust['customer_name'],
+                'error': f'Network error: {type(e).__name__}'
+            })
+            print(f'[{i+1}/{total}] Network error: {cust["customer_name"]} - {type(e).__name__}')
 
         except Exception as e:
             results['failed'] += 1
@@ -272,11 +369,13 @@ def main():
     )
 
     print('\n3. Reading customers from Despatched sheet...')
-    customers = read_customers(
+    customers, invalid_emails = read_customers(
         sheets_service,
         config['google_sheets']['spreadsheet_id']
     )
     print(f'   Found {len(customers)} unique customers')
+    if invalid_emails:
+        print(f'   Skipped {len(invalid_emails)} rows with invalid emails')
 
     print(f'\n4. Importing {len(customers)} customers to ERPNext...')
     results = import_customers(erpnext, customers)
@@ -293,13 +392,16 @@ def main():
         for err in results['errors'][:10]:
             print(f'  - {err["customer"]}: {err["error"][:60]}')
 
-    report_path = '/tmp/customer_migration_report.json'
+    # Use tempfile with timestamp for unique report path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_path = os.path.join(tempfile.gettempdir(), f'customer_migration_report_{timestamp}.json')
     with open(report_path, 'w') as f:
         json.dump({
             'total_customers': len(customers),
             'created': results['created'],
             'skipped': results['skipped'],
             'failed': results['failed'],
+            'invalid_emails': invalid_emails[:50],
             'errors': results['errors']
         }, f, indent=2)
     print(f'\nDetailed report saved to: {report_path}')

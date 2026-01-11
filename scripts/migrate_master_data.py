@@ -16,11 +16,22 @@ import re
 import json
 import time
 import sys
+import tempfile
+from datetime import datetime
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# Configuration from environment variables
+# Constants
+REQUEST_TIMEOUT = 30  # seconds
+VALID_ITEM_GROUPS = [
+    'Booth', 'Acoustic Panel', 'Acoustic Slat', 'Furniture',
+    'Accessory', 'Moss', 'Spare Glass', 'Spare Packaging'
+]
+
+
 def get_config():
     """Load configuration from environment variables"""
     config = {
@@ -59,11 +70,19 @@ def get_config():
     return config
 
 
-# Valid Item Groups
-VALID_ITEM_GROUPS = [
-    'Booth', 'Acoustic Panel', 'Acoustic Slat', 'Furniture',
-    'Accessory', 'Moss', 'Spare Glass', 'Spare Packaging'
-]
+def create_session_with_retry():
+    """Create a requests session with retry logic"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 class ERPNextClient:
@@ -71,17 +90,20 @@ class ERPNextClient:
 
     def __init__(self, url, username, password):
         self.url = url.rstrip('/')
-        self.session = requests.Session()
+        self.session = create_session_with_retry()
         self.login(username, password)
 
     def login(self, username, password):
         """Login and get session cookie"""
         response = self.session.post(
             f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password}
+            data={'usr': username, 'pwd': password},
+            timeout=REQUEST_TIMEOUT
         )
-        if response.status_code != 200 or 'Logged In' not in response.text:
-            raise Exception(f'Login failed: {response.text}')
+        if response.status_code != 200:
+            raise Exception(f'Login failed with status {response.status_code}')
+        if 'Logged In' not in response.text:
+            raise Exception('Login failed: Invalid credentials')
         print(f'Logged in to ERPNext at {self.url}')
 
     def create_item(self, data):
@@ -89,17 +111,27 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Item',
             json=data,
-            headers={'Content-Type': 'application/json'}
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
         )
-        return response.json()
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
 
     def get_item(self, item_code):
         """Get an Item by code"""
         response = self.session.get(
-            f'{self.url}/api/resource/Item/{item_code}'
+            f'{self.url}/api/resource/Item/{item_code}',
+            timeout=REQUEST_TIMEOUT
         )
         if response.status_code == 200:
-            return response.json().get('data')
+            try:
+                return response.json().get('data')
+            except json.JSONDecodeError:
+                return None
         return None
 
 
@@ -131,12 +163,25 @@ def get_sheets_service(config):
 
 
 def clean_price(value):
-    """Convert price string to float: '$1,486.00' -> 1486.00"""
+    """Convert price string to float: '$1,486.00' -> 1486.00
+
+    Handles edge cases like multiple decimal points by keeping only the last one.
+    """
     if not value:
         return 0.0
+    # Remove all non-digit and non-period characters
     cleaned = re.sub(r'[^\d.]', '', str(value))
+    if not cleaned:
+        return 0.0
+
+    # Handle multiple decimal points by keeping only the last one
+    parts = cleaned.split('.')
+    if len(parts) > 2:
+        # Multiple decimals: join all but last with empty string, then add last part
+        cleaned = ''.join(parts[:-1]) + '.' + parts[-1]
+
     try:
-        return float(cleaned) if cleaned else 0.0
+        return float(cleaned)
     except ValueError:
         return 0.0
 
@@ -244,13 +289,29 @@ def import_items(client, items, batch_size=50):
                 results['created'] += 1
                 print(f'[{i+1}/{total}] Created: {item["item_code"]}')
             else:
-                error = response.get('exception', response.get('message', str(response)))
+                error = response.get('exception', response.get('message', response.get('error', 'Unknown error')))
                 results['failed'] += 1
                 results['errors'].append({
                     'item_code': item['item_code'],
                     'error': error
                 })
-                print(f'[{i+1}/{total}] Failed: {item["item_code"]} - {error[:100]}')
+                print(f'[{i+1}/{total}] Failed: {item["item_code"]} - {str(error)[:100]}')
+
+        except requests.exceptions.Timeout:
+            results['failed'] += 1
+            results['errors'].append({
+                'item_code': item['item_code'],
+                'error': 'Request timeout'
+            })
+            print(f'[{i+1}/{total}] Timeout: {item["item_code"]}')
+
+        except requests.exceptions.RequestException as e:
+            results['failed'] += 1
+            results['errors'].append({
+                'item_code': item['item_code'],
+                'error': f'Network error: {type(e).__name__}'
+            })
+            print(f'[{i+1}/{total}] Network error: {item["item_code"]} - {type(e).__name__}')
 
         except Exception as e:
             results['failed'] += 1
@@ -309,7 +370,9 @@ def main():
         for err in results['errors'][:10]:
             print(f'  - {err["item_code"]}: {err["error"][:80]}')
 
-    report_path = '/tmp/migration_report.json'
+    # Use tempfile with timestamp for unique report path
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_path = os.path.join(tempfile.gettempdir(), f'migration_report_{timestamp}.json')
     with open(report_path, 'w') as f:
         json.dump({
             'total_items': len(items),
