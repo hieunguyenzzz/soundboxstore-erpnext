@@ -50,6 +50,9 @@ services:
       UPSTREAM_REAL_IP_RECURSIVE: "off"
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
+    networks:
+      - default
+      - dokploy-network
 
   websocket:
     <<: *backend_defaults
@@ -142,3 +145,7 @@ volumes:
   redis-queue-data:
   sites:
   logs:
+
+networks:
+  dokploy-network:
+    external: true
