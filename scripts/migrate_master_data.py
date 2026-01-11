@@ -277,14 +277,44 @@ def read_masterfile(service, spreadsheet_id):
     return items, skipped
 
 
+def has_changes(existing, new_data, fields):
+    """Check if any field has changed between existing record and new data"""
+    for field in fields:
+        existing_val = existing.get(field)
+        new_val = new_data.get(field)
+        # Normalize None and empty string
+        if existing_val in (None, ''):
+            existing_val = None
+        if new_val in (None, ''):
+            new_val = None
+        # Compare (handle float comparison)
+        if isinstance(new_val, float) or isinstance(existing_val, float):
+            if existing_val is None and new_val is None:
+                continue
+            if existing_val is None or new_val is None:
+                return True
+            if abs(float(existing_val or 0) - float(new_val or 0)) > 0.001:
+                return True
+        elif existing_val != new_val:
+            return True
+    return False
+
+
 def import_items(client, items, batch_size=50):
     """Import items into ERPNext in batches using upsert (update if exists, create if not)"""
     results = {
         'created': 0,
         'updated': 0,
+        'unchanged': 0,
         'failed': 0,
         'errors': []
     }
+
+    # Fields to compare for changes
+    compare_fields = [
+        'item_name', 'description', 'item_group', 'valuation_rate', 'standard_rate',
+        'custom_cbm', 'custom_finish', 'custom_packing_size', 'weight_per_unit'
+    ]
 
     total = len(items)
 
@@ -295,6 +325,12 @@ def import_items(client, items, batch_size=50):
             existing = client.get_item(item['item_code'])
 
             if existing:
+                # Check if anything changed
+                if not has_changes(existing, item, compare_fields):
+                    results['unchanged'] += 1
+                    print(f'[{i+1}/{total}] Unchanged: {item["item_code"]}')
+                    continue
+
                 # Update existing item
                 response = client.update_item(item['item_code'], item)
                 if response.get('data', {}).get('name'):
@@ -387,9 +423,10 @@ def main():
     print('\n' + '=' * 60)
     print('MIGRATION COMPLETE')
     print('=' * 60)
-    print(f'Created: {results["created"]}')
-    print(f'Updated: {results["updated"]}')
-    print(f'Failed:  {results["failed"]}')
+    print(f'Created:   {results["created"]}')
+    print(f'Updated:   {results["updated"]}')
+    print(f'Unchanged: {results["unchanged"]}')
+    print(f'Failed:    {results["failed"]}')
 
     if results['errors']:
         print(f'\nFirst 10 errors:')
@@ -404,6 +441,7 @@ def main():
             'total_items': len(items),
             'created': results['created'],
             'updated': results['updated'],
+            'unchanged': results['unchanged'],
             'failed': results['failed'],
             'skipped_rows': skipped[:50],
             'errors': results['errors']

@@ -341,15 +341,37 @@ def read_containers(service, spreadsheet_id):
     return containers, skipped
 
 
+def has_changes(existing, new_data, fields):
+    """Check if any field has changed between existing record and new data"""
+    for field in fields:
+        existing_val = existing.get(field)
+        new_val = new_data.get(field)
+        # Normalize None and empty string
+        if existing_val in (None, ''):
+            existing_val = None
+        if new_val in (None, ''):
+            new_val = None
+        if existing_val != new_val:
+            return True
+    return False
+
+
 def import_containers(client, containers, batch_size=50):
     """Import containers into ERPNext using upsert (update if exists, create if not)"""
     results = {
         'created': 0,
         'updated': 0,
+        'unchanged': 0,
         'failed': 0,
         'warehouse_warnings': [],
         'errors': []
     }
+
+    # Fields to compare for changes
+    compare_fields = [
+        'container_name', 'container_no', 'capacity', 'shipped_to',
+        'agent', 'provider', 'etd', 'eta'
+    ]
 
     total = len(containers)
 
@@ -384,6 +406,12 @@ def import_containers(client, containers, batch_size=50):
             existing = client.get_container(cont['container_name'])
 
             if existing:
+                # Check if anything changed
+                if not has_changes(existing, container_data, compare_fields):
+                    results['unchanged'] += 1
+                    print(f'[{i+1}/{total}] Unchanged: {cont["container_name"]}')
+                    continue
+
                 # Update existing container
                 response = client.update_container(cont['container_name'], container_data)
                 if response.get('data', {}).get('name'):
@@ -479,9 +507,10 @@ def main():
     print('\n' + '=' * 60)
     print('CONTAINER MIGRATION COMPLETE')
     print('=' * 60)
-    print(f'Created: {results["created"]}')
-    print(f'Updated: {results["updated"]}')
-    print(f'Failed:  {results["failed"]}')
+    print(f'Created:   {results["created"]}')
+    print(f'Updated:   {results["updated"]}')
+    print(f'Unchanged: {results["unchanged"]}')
+    print(f'Failed:    {results["failed"]}')
 
     if results['warehouse_warnings']:
         print(f'\nWarning: {len(results["warehouse_warnings"])} warehouse references not found:')
@@ -501,6 +530,7 @@ def main():
             'total_containers': len(containers),
             'created': results['created'],
             'updated': results['updated'],
+            'unchanged': results['unchanged'],
             'failed': results['failed'],
             'warehouse_warnings': results['warehouse_warnings'],
             'errors': results['errors']

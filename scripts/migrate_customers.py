@@ -193,6 +193,19 @@ class ERPNextClient:
         except json.JSONDecodeError:
             return {'error': 'Invalid JSON response'}
 
+    def get_customer_data(self, customer_id):
+        """Get full customer data by ID"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Customer/{customer_id}',
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            try:
+                return response.json().get('data')
+            except json.JSONDecodeError:
+                return None
+        return None
+
 
 def get_sheets_service(config):
     """Initialize Google Sheets API service"""
@@ -277,14 +290,33 @@ def read_customers(service, spreadsheet_id):
     return list(customers.values()), invalid_emails
 
 
+def has_changes(existing, new_data, fields):
+    """Check if any field has changed between existing record and new data"""
+    for field in fields:
+        existing_val = existing.get(field)
+        new_val = new_data.get(field)
+        # Normalize None and empty string
+        if existing_val in (None, ''):
+            existing_val = None
+        if new_val in (None, ''):
+            new_val = None
+        if existing_val != new_val:
+            return True
+    return False
+
+
 def import_customers(client, customers, batch_size=50):
     """Import customers into ERPNext using upsert (update if exists, create if not)"""
     results = {
         'created': 0,
         'updated': 0,
+        'unchanged': 0,
         'failed': 0,
         'errors': []
     }
+
+    # Fields to compare for changes
+    compare_fields = ['customer_name', 'customer_type', 'customer_group', 'territory']
 
     total = len(customers)
 
@@ -303,6 +335,13 @@ def import_customers(client, customers, batch_size=50):
             existing_id = client.get_customer(cust['customer_name'])
 
             if existing_id:
+                # Get existing customer data to compare
+                existing_data = client.get_customer_data(existing_id)
+                if existing_data and not has_changes(existing_data, customer_data, compare_fields):
+                    results['unchanged'] += 1
+                    print(f'[{i+1}/{total}] Unchanged: {cust["customer_name"]}')
+                    continue
+
                 # Update existing customer
                 response = client.update_customer(existing_id, customer_data)
                 if response.get('data', {}).get('name'):
@@ -412,9 +451,10 @@ def main():
     print('\n' + '=' * 60)
     print('CUSTOMER MIGRATION COMPLETE')
     print('=' * 60)
-    print(f'Created: {results["created"]}')
-    print(f'Updated: {results["updated"]}')
-    print(f'Failed:  {results["failed"]}')
+    print(f'Created:   {results["created"]}')
+    print(f'Updated:   {results["updated"]}')
+    print(f'Unchanged: {results["unchanged"]}')
+    print(f'Failed:    {results["failed"]}')
 
     if results['errors']:
         print(f'\nFirst 10 errors:')
@@ -429,6 +469,7 @@ def main():
             'total_customers': len(customers),
             'created': results['created'],
             'updated': results['updated'],
+            'unchanged': results['unchanged'],
             'failed': results['failed'],
             'invalid_emails': invalid_emails[:50],
             'errors': results['errors']
