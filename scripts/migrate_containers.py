@@ -42,15 +42,32 @@ CONTAINER_DOCTYPE = {
     "editable_grid": 1,
     "track_changes": 1,
     "fields": [
+        # Basic Info Section
         {"fieldname": "container_name", "fieldtype": "Data", "label": "Container Name", "reqd": 1, "unique": 1, "in_list_view": 1},
         {"fieldname": "container_no", "fieldtype": "Data", "label": "Container No.", "in_list_view": 1},
         {"fieldname": "capacity", "fieldtype": "Data", "label": "Capacity"},
         {"fieldname": "shipped_to", "fieldtype": "Link", "label": "Shipped To", "options": "Warehouse"},
         {"fieldname": "agent", "fieldtype": "Data", "label": "Agent"},
         {"fieldname": "provider", "fieldtype": "Data", "label": "Provider"},
+
+        # Dates Section
+        {"fieldname": "section_dates", "fieldtype": "Section Break", "label": "Dates"},
         {"fieldname": "etd", "fieldtype": "Date", "label": "ETD"},
         {"fieldname": "eta", "fieldtype": "Date", "label": "ETA (Docks)"},
-        {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "\nIn Transit\nArrived\nCleared", "default": "In Transit"}
+        {"fieldname": "column_break_dates", "fieldtype": "Column Break"},
+        {"fieldname": "warehouse_receipt_date", "fieldtype": "Date", "label": "Warehouse Receipt Date", "description": "Date when container was booked to warehouse"},
+
+        # Quantities Section
+        {"fieldname": "section_quantities", "fieldtype": "Section Break", "label": "Quantities"},
+        {"fieldname": "expected_qty", "fieldtype": "Float", "label": "Expected Qty", "description": "QTY DUE IN", "precision": 2},
+        {"fieldname": "allocated_qty", "fieldtype": "Float", "label": "Allocated Qty", "description": "QTY SOLD", "precision": 2},
+        {"fieldname": "column_break_qty", "fieldtype": "Column Break"},
+        {"fieldname": "remaining_qty", "fieldtype": "Float", "label": "Remaining Qty", "description": "Expected - Allocated", "precision": 2, "read_only": 1},
+        {"fieldname": "percent_sold", "fieldtype": "Percent", "label": "% Sold", "description": "Percentage of expected qty that is allocated", "read_only": 1},
+
+        # Status Section
+        {"fieldname": "section_status", "fieldtype": "Section Break", "label": "Status"},
+        {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "\nIn Transit\nArrived\nCleared", "default": "In Transit", "in_list_view": 1}
     ],
     "permissions": [
         {"role": "Stock Manager", "read": 1, "write": 1, "create": 1, "delete": 1},
@@ -59,8 +76,12 @@ CONTAINER_DOCTYPE = {
 }
 
 
-def get_config():
-    """Load configuration from environment variables"""
+def get_config(require_google_sheets=True):
+    """Load configuration from environment variables
+
+    Args:
+        require_google_sheets: If False, skip Google Sheets credential validation
+    """
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
@@ -79,7 +100,7 @@ def get_config():
         missing.append('ERPNEXT_URL')
     if not config['erpnext']['password']:
         missing.append('ERPNEXT_PASSWORD')
-    if not config['google_sheets']['credentials']:
+    if require_google_sheets and not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
     if missing:
@@ -87,7 +108,8 @@ def get_config():
         print("\nRequired environment variables:")
         print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
         print("  ERPNEXT_PASSWORD     - ERPNext admin password")
-        print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
+        if require_google_sheets:
+            print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
         print("\nOptional:")
         print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
@@ -140,6 +162,19 @@ class ERPNextClient:
         )
         return response.status_code == 200
 
+    def get_doctype(self, doctype_name):
+        """Get a DocType definition"""
+        response = self.session.get(
+            f'{self.url}/api/resource/DocType/{doctype_name}',
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            try:
+                return response.json().get('data')
+            except json.JSONDecodeError:
+                return None
+        return None
+
     def create_doctype(self, doctype_def):
         """Create a custom DocType"""
         response = self.session.post(
@@ -150,6 +185,21 @@ class ERPNextClient:
         )
         if response.status_code not in (200, 201):
             return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
+
+    def update_doctype(self, doctype_name, doctype_def):
+        """Update an existing DocType"""
+        response = self.session.put(
+            f'{self.url}/api/resource/DocType/{doctype_name}',
+            json=doctype_def,
+            headers={'Content-Type': 'application/json'},
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code not in (200, 201):
+            return {'error': f'HTTP {response.status_code}', 'response': response.text}
         try:
             return response.json()
         except json.JSONDecodeError:
@@ -207,11 +257,53 @@ class ERPNextClient:
         return response.status_code == 200
 
 
-def ensure_container_doctype(client):
-    """Create Container custom doctype if it doesn't exist"""
+def ensure_container_doctype(client, force_update=False):
+    """Create or update Container custom doctype
+
+    Args:
+        client: ERPNextClient instance
+        force_update: If True, update the DocType even if it exists (to add new fields)
+    """
     if client.doctype_exists('Container'):
-        print('   Container doctype already exists')
-        return True
+        if not force_update:
+            print('   Container doctype already exists (use --update-doctype to update fields)')
+            return True
+
+        # Update existing DocType with new field definitions
+        print('   Updating Container doctype fields...')
+        existing = client.get_doctype('Container')
+        if not existing:
+            print('   ERROR: Could not fetch existing Container doctype')
+            return False
+
+        # Get existing field names for comparison
+        existing_fieldnames = {f['fieldname'] for f in existing.get('fields', [])}
+        new_fieldnames = {f['fieldname'] for f in CONTAINER_DOCTYPE['fields']}
+
+        # Find fields to add
+        fields_to_add = new_fieldnames - existing_fieldnames
+        if fields_to_add:
+            print(f'   Adding new fields: {", ".join(sorted(fields_to_add))}')
+
+        # Prepare update payload - replace entire fields list
+        update_payload = {
+            'fields': CONTAINER_DOCTYPE['fields']
+        }
+
+        response = client.update_doctype('Container', update_payload)
+
+        if response.get('data', {}).get('name'):
+            print('   Container doctype updated successfully')
+            if fields_to_add:
+                print(f'   Added {len(fields_to_add)} new field(s)')
+            return True
+        else:
+            error = response.get('error', 'Unknown error')
+            resp_text = response.get('response', '')[:200] if response.get('response') else ''
+            print(f'   ERROR: Failed to update Container doctype: {error}')
+            if resp_text:
+                print(f'   Response: {resp_text}')
+            return False
 
     print('   Creating Container doctype...')
     response = client.create_doctype(CONTAINER_DOCTYPE)
@@ -473,14 +565,28 @@ def import_containers(client, containers, batch_size=50):
 
 def main():
     """Main migration function"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Container Migration Script')
+    parser.add_argument('--update-doctype', action='store_true',
+                       help='Update Container DocType with new field definitions')
+    parser.add_argument('--doctype-only', action='store_true',
+                       help='Only create/update DocType, skip data migration')
+    args = parser.parse_args()
+
     print('=' * 60)
     print('SBS-51: Container Migration')
     print('=' * 60)
 
-    config = get_config()
+    # For doctype-only mode, we don't need Google Sheets credentials
+    config = get_config(require_google_sheets=not args.doctype_only)
 
-    print('\n1. Connecting to Google Sheets...')
-    sheets_service = get_sheets_service(config)
+    # For doctype-only mode, we don't need Google Sheets
+    if not args.doctype_only:
+        print('\n1. Connecting to Google Sheets...')
+        sheets_service = get_sheets_service(config)
+    else:
+        sheets_service = None
 
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
@@ -490,9 +596,19 @@ def main():
     )
 
     print('\n3. Ensuring Container doctype exists...')
-    if not ensure_container_doctype(erpnext):
+    force_update = args.update_doctype or args.doctype_only
+    if not ensure_container_doctype(erpnext, force_update=force_update):
         print('ERROR: Cannot proceed without Container doctype')
         sys.exit(1)
+
+    # If doctype-only mode, we're done
+    if args.doctype_only:
+        print('\n' + '=' * 60)
+        print('DOCTYPE UPDATE COMPLETE')
+        print('=' * 60)
+        print('Container DocType has been created/updated.')
+        print('Run without --doctype-only to import container data.')
+        sys.exit(0)
 
     print('\n4. Reading containers from Container Status sheet...')
     containers, skipped = read_containers(

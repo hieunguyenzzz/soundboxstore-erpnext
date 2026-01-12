@@ -33,30 +33,29 @@ from googleapiclient.discovery import build
 
 # Constants
 REQUEST_TIMEOUT = 30  # seconds
-COMPANY = "Soundbox Store"
 
-# Warehouse mapping: Google Sheets location -> ERPNext warehouse name
-# ERPNext warehouses use " - SBS" suffix
-WAREHOUSE_MAPPING = {
+# Warehouse mapping: Google Sheets location -> ERPNext warehouse base name
+# The company abbreviation suffix will be added dynamically
+WAREHOUSE_BASE_MAPPING = {
     # Existing warehouses from SBS-51
-    'FOR MANUFACTURE': 'For Manufacture - SBS',
-    'ON WATER': 'Goods on Water - SBS',
+    'FOR MANUFACTURE': 'For Manufacture',
+    'ON WATER': 'Goods on Water',
     # New warehouses to be created
-    'BEACONSFIELD OFFICE': 'Beaconsfield Office - SBS',
-    'BEACONSFIELD SHOWROOM': 'Beaconsfield Showroom - SBS',
-    'GRAFANOLA SHOWROOM': 'Grafanola Showroom - SBS',
-    'STOCK IN UBI - HODDESDON': 'Stock In UBI Hoddesdon - SBS',
-    'STOCK IN UBI - WARRINGTON': 'Stock In UBI Warrington - SBS',
-    'STOCK IN WAREHOUSE - ES': 'Stock In Warehouse ES - SBS',
-    'STOCK IN WAREHOUSE - ES - GRADE A': 'Stock In Warehouse ES Grade A - SBS',
-    'STOCK IN WAREHOUSE - UK - FSL': 'Stock In Warehouse UK FSL - SBS',
-    'STOCK IN WAREHOUSE - UK - MAR': 'Stock In Warehouse UK MAR - SBS',
-    'STOCK IN WAREHOUSE - UK - PRIM': 'Stock In Warehouse UK PRIM - SBS',
-    'WAITING CLEARANCE': 'Waiting Clearance - SBS',
+    'BEACONSFIELD OFFICE': 'Beaconsfield Office',
+    'BEACONSFIELD SHOWROOM': 'Beaconsfield Showroom',
+    'GRAFANOLA SHOWROOM': 'Grafanola Showroom',
+    'STOCK IN UBI - HODDESDON': 'Stock In UBI Hoddesdon',
+    'STOCK IN UBI - WARRINGTON': 'Stock In UBI Warrington',
+    'STOCK IN WAREHOUSE - ES': 'Stock In Warehouse ES',
+    'STOCK IN WAREHOUSE - ES - GRADE A': 'Stock In Warehouse ES Grade A',
+    'STOCK IN WAREHOUSE - UK - FSL': 'Stock In Warehouse UK FSL',
+    'STOCK IN WAREHOUSE - UK - MAR': 'Stock In Warehouse UK MAR',
+    'STOCK IN WAREHOUSE - UK - PRIM': 'Stock In Warehouse UK PRIM',
+    'WAITING CLEARANCE': 'Waiting Clearance',
 }
 
-# Default warehouse for unmapped locations
-DEFAULT_WAREHOUSE = 'Stores - SBS'
+# Default warehouse base name (suffix added dynamically)
+DEFAULT_WAREHOUSE_BASE = 'Stores'
 
 
 def get_config():
@@ -66,6 +65,7 @@ def get_config():
             'url': os.environ.get('ERPNEXT_URL'),
             'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
             'password': os.environ.get('ERPNEXT_PASSWORD'),
+            'company_abbr': os.environ.get('ERPNEXT_COMPANY_ABBR'),  # Optional, auto-detect if not set
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -90,6 +90,7 @@ def get_config():
         print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
         print("\nOptional:")
         print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
+        print("  ERPNEXT_COMPANY_ABBR - Company abbreviation (auto-detected if not set)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
@@ -114,10 +115,61 @@ def create_session_with_retry():
 class ERPNextClient:
     """ERPNext API Client"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, username, password, company_abbr=None):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
         self.login(username, password)
+        # Use provided abbreviation or auto-detect
+        if company_abbr:
+            self.company_abbr = company_abbr
+            self.company_name = self._get_company_name_by_abbr(company_abbr)
+        else:
+            self.company_name, self.company_abbr = self._get_company_info()
+        print(f'Using company: {self.company_name} (abbr: {self.company_abbr})')
+
+    def _get_company_name_by_abbr(self, abbr):
+        """Get company name by abbreviation"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Company',
+            params={
+                'filters': json.dumps([['abbr', '=', abbr]]),
+                'limit_page_length': 1
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            companies = response.json().get('data', [])
+            if companies:
+                return companies[0]['name']
+        # Fall back to just getting first company
+        return self._get_company_info()[0]
+
+    def _get_company_info(self):
+        """Get the first company's name and abbreviation"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Company',
+            params={'limit_page_length': 1},
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code != 200:
+            raise Exception('Failed to fetch company list')
+
+        companies = response.json().get('data', [])
+        if not companies:
+            raise Exception('No company found in ERPNext')
+
+        company_name = companies[0]['name']
+
+        # Get full company details for abbreviation
+        response = self.session.get(
+            f'{self.url}/api/resource/Company/{company_name}',
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code != 200:
+            raise Exception(f'Failed to fetch company details for {company_name}')
+
+        company_data = response.json().get('data', {})
+        return company_data.get('name'), company_data.get('abbr', 'SBS')
 
     def login(self, username, password):
         """Login and get session cookie"""
@@ -223,10 +275,12 @@ class ERPNextClient:
 
     def create_warehouse(self, warehouse_name):
         """Create a new warehouse"""
-        # Extract parent warehouse from name
+        # Extract base warehouse name by removing company suffix
+        suffix = f' - {self.company_abbr}'
+        base_name = warehouse_name.replace(suffix, '') if warehouse_name.endswith(suffix) else warehouse_name
         data = {
-            'warehouse_name': warehouse_name.replace(' - SBS', ''),
-            'company': COMPANY,
+            'warehouse_name': base_name,
+            'company': self.company_name,
             'is_group': 0,
         }
         response = self.session.post(
@@ -283,7 +337,7 @@ class ERPNextClient:
             'year': year,
             'year_start_date': f'{year}-01-01',
             'year_end_date': f'{year}-12-31',
-            'companies': [{'company': COMPANY}]
+            'companies': [{'company': self.company_name}]
         }
         response = self.session.post(
             f'{self.url}/api/resource/Fiscal Year',
@@ -304,7 +358,7 @@ class ERPNextClient:
             'doctype': 'Stock Entry',
             'stock_entry_type': 'Material Receipt',
             'posting_date': posting_date,
-            'company': COMPANY,
+            'company': self.company_name,
             'items': items
         }
         response = self.session.post(
@@ -397,26 +451,28 @@ def clean_float(value):
         return 0.0
 
 
-def resolve_warehouse(location):
+def resolve_warehouse(location, company_abbr):
     """Map Google Sheets location to ERPNext warehouse name"""
+    suffix = f' - {company_abbr}'
+
     if not location:
-        return DEFAULT_WAREHOUSE
+        return DEFAULT_WAREHOUSE_BASE + suffix
 
     location = location.strip().upper()
 
     # Check direct mapping
-    if location in WAREHOUSE_MAPPING:
-        return WAREHOUSE_MAPPING[location]
+    if location in WAREHOUSE_BASE_MAPPING:
+        return WAREHOUSE_BASE_MAPPING[location] + suffix
 
     # Try to find partial match
-    for sheet_loc, erp_wh in WAREHOUSE_MAPPING.items():
+    for sheet_loc, erp_wh_base in WAREHOUSE_BASE_MAPPING.items():
         if sheet_loc in location or location in sheet_loc:
-            return erp_wh
+            return erp_wh_base + suffix
 
-    return DEFAULT_WAREHOUSE
+    return DEFAULT_WAREHOUSE_BASE + suffix
 
 
-def read_inventory(service, spreadsheet_id):
+def read_inventory(service, spreadsheet_id, company_abbr):
     """Read inventory data from Google Sheets
 
     Columns:
@@ -456,7 +512,7 @@ def read_inventory(service, spreadsheet_id):
             'item_code': sku,
             'qty': remaining_qty,
             'location': location,
-            'warehouse': resolve_warehouse(location)
+            'warehouse': resolve_warehouse(location, company_abbr)
         })
 
     return inventory, skipped
@@ -665,20 +721,22 @@ def main():
 
     config = get_config()
 
-    print('\n1. Connecting to Google Sheets...')
-    sheets_service = get_sheets_service(config)
-
-    print('\n2. Connecting to ERPNext...')
+    print('\n1. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
         config['erpnext']['username'],
-        config['erpnext']['password']
+        config['erpnext']['password'],
+        config['erpnext']['company_abbr']
     )
+
+    print('\n2. Connecting to Google Sheets...')
+    sheets_service = get_sheets_service(config)
 
     print('\n3. Reading Inventory sheet...')
     inventory, skipped = read_inventory(
         sheets_service,
-        config['google_sheets']['spreadsheet_id']
+        config['google_sheets']['spreadsheet_id'],
+        erpnext.company_abbr
     )
     print(f'   Found {len(inventory)} items with stock')
     print(f'   Skipped {len(skipped)} items (zero/negative stock)')

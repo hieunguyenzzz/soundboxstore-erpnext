@@ -259,6 +259,7 @@ def read_masterfile(service, spreadsheet_id):
             'include_item_in_manufacturing': 0,
             'valuation_rate': clean_price(get_col(6)),
             'standard_rate': clean_price(get_col(7)),
+            'custom_sku': sku,  # Required custom field from SBS-53
             'custom_cbm': clean_float(get_col(8)),
             'custom_finish': clean_text(get_col(5)),
             'custom_packing_size': clean_text(get_col(33)),
