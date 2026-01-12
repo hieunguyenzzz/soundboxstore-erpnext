@@ -334,15 +334,24 @@ def read_allocations(service, spreadsheet_id, sheet_name):
         def get_col(idx):
             return row[idx] if idx < len(row) else ''
 
-        # Try to identify order reference - could be in different columns
-        # Common patterns: Order No, Customer Name, Reference
-        order_ref = clean_text(get_col(1)) or clean_text(get_col(0))  # Col B or A
-        sku = clean_text(get_col(3))  # Col D typically has SKU
-        qty = clean_int(get_col(4))  # Col E typically has qty
-        warehouse = clean_text(get_col(6))  # Col G might have warehouse
+        # Different column mappings for different sheets
+        if sheet_name == 'Temp Allocation':
+            # Temp Allocation columns:
+            # A=ref, B=REF (order ref), C=Name, D=SBS SKU, E=Product, F=Batch, G=Location, H=Container, I=QTY
+            order_ref = clean_text(get_col(1))  # Col B: REF (like PI-20240001)
+            sku = clean_text(get_col(3))  # Col D: SBS SKU
+            qty = clean_int(get_col(8)) or 1  # Col I: QTY (default to 1 if 0)
+            warehouse = clean_text(get_col(6))  # Col G: CURRENT LOCATION
+        else:
+            # Allocation sheet columns:
+            # A=row#, B=concat_ref, C=Order No, D=Name, E=Country, F=SKU, G=Product, H=Batch, I=Location, J=Container
+            order_ref = clean_text(get_col(2))  # Col C: Order No.
+            sku = clean_text(get_col(5))  # Col F: SKU
+            qty = 1  # Each row represents 1 unit allocation
+            warehouse = clean_text(get_col(8))  # Col I: CURRENT LOCATION
 
         # Skip if no meaningful data
-        if not sku or qty <= 0:
+        if not sku or not order_ref:
             continue
 
         allocations.append({
