@@ -9,6 +9,10 @@ This script orchestrates:
 3. migrate_containers.py - Shipping Containers (SBS-51)
 4. migrate_inventory.py - Opening Stock (SBS-52)
 5. process_container_arrivals.py - Container Arrivals (SBS-59)
+6. migrate_purchase_orders.py - Purchase Orders (SBS-61)
+7. migrate_sales_orders.py - Sales Orders (SBS-61)
+8. migrate_stock_reservations.py - Stock Reservations (SBS-61)
+9. stock_reconciliation_report.py - Stock Reconciliation (SBS-61)
 
 Environment Variables (same as individual scripts):
   ERPNEXT_URL          - ERPNext server URL (required)
@@ -41,6 +45,10 @@ def main():
     print('  3. Containers (migrate_containers.py)')
     print('  4. Inventory (migrate_inventory.py)')
     print('  5. Container Arrivals (process_container_arrivals.py)')
+    print('  6. Purchase Orders (migrate_purchase_orders.py)')
+    print('  7. Sales Orders (migrate_sales_orders.py)')
+    print('  8. Stock Reservations (migrate_stock_reservations.py)')
+    print('  9. Stock Reconciliation Report (stock_reconciliation_report.py)')
     print('')
 
     results = {
@@ -48,7 +56,11 @@ def main():
         'customers': None,
         'containers': None,
         'inventory': None,
-        'arrivals': None
+        'arrivals': None,
+        'purchase_orders': None,
+        'sales_orders': None,
+        'stock_reservations': None,
+        'reconciliation': None
     }
 
     # 1. Products/Items
@@ -120,6 +132,63 @@ def main():
     except Exception as e:
         print(f'ERROR in container arrivals: {e}')
         results['arrivals'] = 'failed'
+
+    # 6. Purchase Orders (SBS-61)
+    print('\n' + '=' * 70)
+    print('PHASE 6: PURCHASE ORDERS')
+    print('=' * 70)
+    try:
+        from migrate_purchase_orders import main as sync_purchase_orders
+        sync_purchase_orders()
+        results['purchase_orders'] = 'success'
+    except SystemExit as e:
+        results['purchase_orders'] = 'failed' if e.code != 0 else 'success'
+    except Exception as e:
+        print(f'ERROR in purchase orders migration: {e}')
+        results['purchase_orders'] = 'failed'
+
+    # 7. Sales Orders (SBS-61)
+    print('\n' + '=' * 70)
+    print('PHASE 7: SALES ORDERS')
+    print('=' * 70)
+    try:
+        from migrate_sales_orders import main as sync_sales_orders
+        sync_sales_orders()
+        results['sales_orders'] = 'success'
+    except SystemExit as e:
+        results['sales_orders'] = 'failed' if e.code != 0 else 'success'
+    except Exception as e:
+        print(f'ERROR in sales orders migration: {e}')
+        results['sales_orders'] = 'failed'
+
+    # 8. Stock Reservations (SBS-61)
+    print('\n' + '=' * 70)
+    print('PHASE 8: STOCK RESERVATIONS')
+    print('=' * 70)
+    try:
+        from migrate_stock_reservations import main as sync_stock_reservations
+        sync_stock_reservations()
+        results['stock_reservations'] = 'success'
+    except SystemExit as e:
+        results['stock_reservations'] = 'failed' if e.code != 0 else 'success'
+    except Exception as e:
+        print(f'ERROR in stock reservations migration: {e}')
+        results['stock_reservations'] = 'failed'
+
+    # 9. Stock Reconciliation Report (SBS-61) - Non-blocking
+    print('\n' + '=' * 70)
+    print('PHASE 9: STOCK RECONCILIATION REPORT')
+    print('=' * 70)
+    try:
+        from stock_reconciliation_report import main as run_reconciliation
+        run_reconciliation()
+        results['reconciliation'] = 'success'
+    except SystemExit as e:
+        # Reconciliation report is informational, always treat as success
+        results['reconciliation'] = 'success'
+    except Exception as e:
+        print(f'ERROR in stock reconciliation: {e}')
+        results['reconciliation'] = 'failed'
 
     # Summary
     print('\n' + '=' * 70)
