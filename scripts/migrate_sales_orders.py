@@ -10,8 +10,8 @@ Data Sources and Status Mapping:
 
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
-  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD     - ERPNext password (required)
+  ERPNEXT_API_KEY      - ERPNext API Key (required)
+  ERPNEXT_API_SECRET   - ERPNext API Secret (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
 """
@@ -32,9 +32,9 @@ from googleapiclient.discovery import build
 
 # Constants
 REQUEST_TIMEOUT = 30  # seconds
-COMPANY = "Soundbox Store"
+COMPANY = "DWIR"
 BATCH_SIZE = 50
-DEFAULT_WAREHOUSE = 'Stores - SBS'
+DEFAULT_WAREHOUSE = 'Stores - D'
 
 # Sheet to status mapping
 SHEET_STATUS = {
@@ -49,8 +49,8 @@ def get_config():
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
-            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-            'password': os.environ.get('ERPNEXT_PASSWORD'),
+            'api_key': os.environ.get('ERPNEXT_API_KEY'),
+            'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -62,8 +62,10 @@ def get_config():
     missing = []
     if not config['erpnext']['url']:
         missing.append('ERPNEXT_URL')
-    if not config['erpnext']['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['erpnext']['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['erpnext']['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
     if not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
@@ -71,10 +73,10 @@ def get_config():
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("\nRequired environment variables:")
         print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
+        print("  ERPNEXT_API_KEY      - ERPNext API Key")
+        print("  ERPNEXT_API_SECRET   - ERPNext API Secret")
         print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
         print("\nOptional:")
-        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
@@ -99,23 +101,29 @@ def create_session_with_retry():
 class ERPNextClient:
     """ERPNext API Client"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
+        # Set up API key authentication
+        self.session.headers.update({
+            'Authorization': f'token {api_key}:{api_secret}'
+        })
+        # Verify connection
+        self._verify_connection()
 
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
+    def _verify_connection(self):
+        """Verify API connection works"""
+        response = self.session.get(
+            f'{self.url}/api/method/frappe.auth.get_logged_user',
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
+            raise Exception(f'API connection failed with status {response.status_code}')
+        try:
+            user = response.json().get('message')
+            print(f'Connected to ERPNext at {self.url} as {user}')
+        except json.JSONDecodeError:
+            raise Exception('API connection failed: Invalid response')
 
     def get_customer_by_name(self, customer_name):
         """Get a Customer by name"""
@@ -679,8 +687,8 @@ def main():
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
-        config['erpnext']['username'],
-        config['erpnext']['password']
+        config['erpnext']['api_key'],
+        config['erpnext']['api_secret']
     )
 
     # Read from all sales sheets

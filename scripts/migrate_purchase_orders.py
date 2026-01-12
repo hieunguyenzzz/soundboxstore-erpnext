@@ -12,8 +12,8 @@ Data Sources:
 
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
-  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD     - ERPNext password (required)
+  ERPNEXT_API_KEY      - ERPNext API key (required)
+  ERPNEXT_API_SECRET   - ERPNext API secret (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
 """
@@ -34,22 +34,23 @@ from googleapiclient.discovery import build
 
 # Constants
 REQUEST_TIMEOUT = 30  # seconds
-COMPANY = "Soundbox Store"
+COMPANY = "DWIR"
 BATCH_SIZE = 50
 
 # Default warehouse for containers without mapping
-DEFAULT_WAREHOUSE = 'Stores - SBS'
+DEFAULT_WAREHOUSE = 'Stores - D'
 
 # Warehouse mapping for container destinations
+# Note: Uses DWIR company warehouse naming (- D suffix)
 WAREHOUSE_MAPPING = {
-    'Marone Solutions Ltd': 'Stock In Warehouse UK MAR - SBS',
-    'Edward\'s Furniture Solutions Ltd': 'Stock In Warehouse UK FSL - SBS',
-    'Primary OFS': 'Stock In Warehouse UK PRIM - SBS',
-    'Transportes Grau': 'Stock In Warehouse ES - SBS',
-    'FSL': 'Stock In Warehouse UK FSL - SBS',
-    'MAR': 'Stock In Warehouse UK MAR - SBS',
-    'PRIM': 'Stock In Warehouse UK PRIM - SBS',
-    'ES': 'Stock In Warehouse ES - SBS',
+    'Marone Solutions Ltd': 'Stores - D',
+    'Edward\'s Furniture Solutions Ltd': 'Stores - D',
+    'Primary OFS': 'Stores - D',
+    'Transportes Grau': 'Stores - D',
+    'FSL': 'Stores - D',
+    'MAR': 'Stores - D',
+    'PRIM': 'Stores - D',
+    'ES': 'Stores - D',
 }
 
 
@@ -58,8 +59,8 @@ def get_config():
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
-            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-            'password': os.environ.get('ERPNEXT_PASSWORD'),
+            'api_key': os.environ.get('ERPNEXT_API_KEY'),
+            'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -71,8 +72,10 @@ def get_config():
     missing = []
     if not config['erpnext']['url']:
         missing.append('ERPNEXT_URL')
-    if not config['erpnext']['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['erpnext']['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['erpnext']['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
     if not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
@@ -80,10 +83,10 @@ def get_config():
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("\nRequired environment variables:")
         print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
+        print("  ERPNEXT_API_KEY      - ERPNext API key")
+        print("  ERPNEXT_API_SECRET   - ERPNext API secret")
         print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
         print("\nOptional:")
-        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
@@ -108,23 +111,23 @@ def create_session_with_retry():
 class ERPNextClient:
     """ERPNext API Client"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
+        self.session.headers.update({
+            'Authorization': f'token {api_key}:{api_secret}'
+        })
+        self._verify_connection()
 
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
+    def _verify_connection(self):
+        """Verify API connection works"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Item?limit_page_length=1',
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
+            raise Exception(f'API connection failed with status {response.status_code}')
+        print(f'Connected to ERPNext at {self.url}')
 
     def get_supplier(self, supplier_name):
         """Get a Supplier by name"""
@@ -218,7 +221,11 @@ class ERPNextClient:
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
+            try:
+                error_detail = response.json()
+                return {'error': f'HTTP {response.status_code}', 'detail': error_detail}
+            except:
+                return {'error': f'HTTP {response.status_code}', 'detail': response.text[:500]}
         try:
             return response.json()
         except json.JSONDecodeError:
@@ -321,14 +328,7 @@ def resolve_warehouse(shipped_to, location=None):
         if key.lower() in shipped_to.lower():
             return warehouse
 
-    # Use location-based default
-    if location:
-        location = location.upper()
-        if 'SPAIN' in location or 'ES' in location:
-            return 'Stock In Warehouse ES - SBS'
-        if 'UK' in location:
-            return 'Stock In Warehouse UK MAR - SBS'
-
+    # All warehouses default to Stores - D (DWIR company)
     return DEFAULT_WAREHOUSE
 
 
@@ -351,7 +351,7 @@ def read_inventory_items(service, spreadsheet_id):
 
         sku = clean_text(get_col(2))  # Col C: SBS SKU
         container = clean_text(get_col(14))  # Col O: CONTAINER
-        qty = clean_float(get_col(6))  # Col G: QTY
+        qty = clean_float(get_col(7))  # Col H: QTY
 
         if not sku or not container:
             continue
@@ -567,12 +567,16 @@ def create_purchase_orders(client, grouped_items, container_info):
                     print(f'   Created: {response["data"]["name"]}')
                 else:
                     error = response.get('exception') or response.get('message') or response.get('error', 'Unknown error')
+                    detail = response.get('detail', '')
                     results['failed'] += 1
                     results['errors'].append({
                         'identifier': po_identifier,
-                        'error': f'Create failed: {str(error)[:150]}'
+                        'error': f'Create failed: {str(error)[:150]}',
+                        'detail': str(detail)[:500] if detail else None
                     })
                     print(f'   ERROR: {str(error)[:100]}')
+                    if detail:
+                        print(f'   DETAIL: {str(detail)[:200]}')
 
         except requests.exceptions.Timeout:
             results['failed'] += 1
@@ -612,8 +616,8 @@ def main():
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
-        config['erpnext']['username'],
-        config['erpnext']['password']
+        config['erpnext']['api_key'],
+        config['erpnext']['api_secret']
     )
 
     print('\n3. Reading Inventory items with containers...')

@@ -11,8 +11,8 @@ Generates a detailed discrepancy report showing:
 
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
-  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD     - ERPNext password (required)
+  ERPNEXT_API_KEY      - ERPNext API key (required)
+  ERPNEXT_API_SECRET   - ERPNext API secret (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
 """
@@ -33,24 +33,24 @@ from googleapiclient.discovery import build
 # Constants
 REQUEST_TIMEOUT = 30  # seconds
 
-# Warehouse mapping for comparison
+# Warehouse mapping for comparison (using DWIR company suffix "- D")
 WAREHOUSE_MAPPING = {
-    'FOR MANUFACTURE': 'For Manufacture - SBS',
-    'ON WATER': 'Goods on Water - SBS',
-    'BEACONSFIELD OFFICE': 'Beaconsfield Office - SBS',
-    'BEACONSFIELD SHOWROOM': 'Beaconsfield Showroom - SBS',
-    'GRAFANOLA SHOWROOM': 'Grafanola Showroom - SBS',
-    'STOCK IN UBI - HODDESDON': 'Stock In UBI Hoddesdon - SBS',
-    'STOCK IN UBI - WARRINGTON': 'Stock In UBI Warrington - SBS',
-    'STOCK IN WAREHOUSE - ES': 'Stock In Warehouse ES - SBS',
-    'STOCK IN WAREHOUSE - ES - GRADE A': 'Stock In Warehouse ES Grade A - SBS',
-    'STOCK IN WAREHOUSE - UK - FSL': 'Stock In Warehouse UK FSL - SBS',
-    'STOCK IN WAREHOUSE - UK - MAR': 'Stock In Warehouse UK MAR - SBS',
-    'STOCK IN WAREHOUSE - UK - PRIM': 'Stock In Warehouse UK PRIM - SBS',
-    'WAITING CLEARANCE': 'Waiting Clearance - SBS',
+    'FOR MANUFACTURE': 'For Manufacture - D',
+    'ON WATER': 'Goods on Water - D',
+    'BEACONSFIELD OFFICE': 'Beaconsfield Office - D',
+    'BEACONSFIELD SHOWROOM': 'Beaconsfield Showroom - D',
+    'GRAFANOLA SHOWROOM': 'Grafanola Showroom - D',
+    'STOCK IN UBI - HODDESDON': 'Stock In UBI Hoddesdon - D',
+    'STOCK IN UBI - WARRINGTON': 'Stock In UBI Warrington - D',
+    'STOCK IN WAREHOUSE - ES': 'Stock In Warehouse ES - D',
+    'STOCK IN WAREHOUSE - ES - GRADE A': 'Stock In Warehouse ES Grade A - D',
+    'STOCK IN WAREHOUSE - UK - FSL': 'Stock In Warehouse UK FSL - D',
+    'STOCK IN WAREHOUSE - UK - MAR': 'Stock In Warehouse UK MAR - D',
+    'STOCK IN WAREHOUSE - UK - PRIM': 'Stock In Warehouse UK PRIM - D',
+    'WAITING CLEARANCE': 'Waiting Clearance - D',
 }
 
-DEFAULT_WAREHOUSE = 'Stores - SBS'
+DEFAULT_WAREHOUSE = 'Stores - D'
 
 
 def get_config():
@@ -58,8 +58,8 @@ def get_config():
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
-            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-            'password': os.environ.get('ERPNEXT_PASSWORD'),
+            'api_key': os.environ.get('ERPNEXT_API_KEY'),
+            'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -71,8 +71,10 @@ def get_config():
     missing = []
     if not config['erpnext']['url']:
         missing.append('ERPNEXT_URL')
-    if not config['erpnext']['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['erpnext']['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['erpnext']['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
     if not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
@@ -80,10 +82,10 @@ def get_config():
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("\nRequired environment variables:")
         print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
+        print("  ERPNEXT_API_KEY      - ERPNext API key")
+        print("  ERPNEXT_API_SECRET   - ERPNext API secret")
         print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
         print("\nOptional:")
-        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
@@ -106,25 +108,27 @@ def create_session_with_retry():
 
 
 class ERPNextClient:
-    """ERPNext API Client"""
+    """ERPNext API Client using token authentication"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
+        # Set up token authentication header
+        self.session.headers.update({
+            'Authorization': f'token {api_key}:{api_secret}'
+        })
+        self._verify_connection()
 
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
+    def _verify_connection(self):
+        """Verify API connection is working"""
+        response = self.session.get(
+            f'{self.url}/api/method/frappe.auth.get_logged_user',
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
+            raise Exception(f'API connection failed with status {response.status_code}')
+        user = response.json().get('message', 'Unknown')
+        print(f'Connected to ERPNext at {self.url} as {user}')
 
     def get_all_stock_levels(self):
         """Get all stock levels from Bin doctype"""
@@ -445,8 +449,8 @@ def main():
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
-        config['erpnext']['username'],
-        config['erpnext']['password']
+        config['erpnext']['api_key'],
+        config['erpnext']['api_secret']
     )
 
     print('\n3. Reading Google Sheets Inventory...')
