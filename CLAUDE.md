@@ -52,7 +52,35 @@ open http://sbserp.loc
 
 All order data, inventory levels, customers, and containers are being migrated from Google Sheets to ERPNext. Once migration is complete, the original Google Sheets will no longer be needed.
 
-**Migration Status:** In progress - see `scripts/` for migration scripts.
+**Migration Status:** In progress
+
+## Migration Commands
+
+```bash
+# Run all migrations in order
+python scripts/migrate.py
+
+# Preview without changes
+python scripts/migrate.py --dry-run
+
+# Clear all transactional data (keep master data)
+python scripts/clear_data.py
+
+# Clear everything including master data
+python scripts/clear_data.py --scope all
+
+# Preview clear without executing
+python scripts/clear_data.py --dry-run
+```
+
+### Migration Steps (in order)
+1. `master_data` - Products/Items
+2. `customers` - Customers, Addresses, Contacts
+3. `containers` - Container tracking
+4. `inventory` - Opening stock
+5. `sales_orders` - Sales Orders + Delivery Notes
+6. `purchase_orders` - Purchase Orders
+7. `allocations` - Container Pre-Allocations
 
 ## Subagent Usage
 
