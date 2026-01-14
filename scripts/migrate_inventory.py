@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SBS-52: Inventory Migration Script
-Imports opening stock from Google Sheets Inventory into ERPNext via Stock Entry
+SBS-64: Inventory Migration Script
+Imports opening stock from Google Sheets Inventory into ERPNext via Stock Entry.
 
 This script:
 1. Reads inventory data from Google Sheets (REMAINING QTY column)
@@ -9,12 +9,20 @@ This script:
 3. Creates Stock Entry (Material Receipt) per warehouse
 4. Uses valuation rates from existing Item master
 
+Columns (0-indexed):
+- C (2):  SBS SKU - item_code
+- L (11): REMAINING QTY - available stock for sale
+- N (13): CURRENT LOCATION - warehouse
+
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
-  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD     - ERPNext password (required)
+  ERPNEXT_API_KEY      - ERPNext API key (required)
+  ERPNEXT_API_SECRET   - ERPNext API secret (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
+
+Usage:
+  python scripts/migrate_inventory.py
 """
 
 import os
@@ -35,12 +43,9 @@ from googleapiclient.discovery import build
 REQUEST_TIMEOUT = 30  # seconds
 
 # Warehouse mapping: Google Sheets location -> ERPNext warehouse base name
-# The company abbreviation suffix will be added dynamically
 WAREHOUSE_BASE_MAPPING = {
-    # Existing warehouses from SBS-51
     'FOR MANUFACTURE': 'For Manufacture',
     'ON WATER': 'Goods on Water',
-    # New warehouses to be created
     'BEACONSFIELD OFFICE': 'Beaconsfield Office',
     'BEACONSFIELD SHOWROOM': 'Beaconsfield Showroom',
     'GRAFANOLA SHOWROOM': 'Grafanola Showroom',
@@ -54,7 +59,6 @@ WAREHOUSE_BASE_MAPPING = {
     'WAITING CLEARANCE': 'Waiting Clearance',
 }
 
-# Default warehouse base name (suffix added dynamically)
 DEFAULT_WAREHOUSE_BASE = 'Stores'
 
 
@@ -63,9 +67,8 @@ def get_config():
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
-            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-            'password': os.environ.get('ERPNEXT_PASSWORD'),
-            'company_abbr': os.environ.get('ERPNEXT_COMPANY_ABBR'),  # Optional, auto-detect if not set
+            'api_key': os.environ.get('ERPNEXT_API_KEY'),
+            'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -77,21 +80,15 @@ def get_config():
     missing = []
     if not config['erpnext']['url']:
         missing.append('ERPNEXT_URL')
-    if not config['erpnext']['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['erpnext']['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['erpnext']['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
     if not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
-        print("\nRequired environment variables:")
-        print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
-        print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
-        print("\nOptional:")
-        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
-        print("  ERPNEXT_COMPANY_ABBR - Company abbreviation (auto-detected if not set)")
-        print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
     return config
@@ -115,40 +112,35 @@ def create_session_with_retry():
 class ERPNextClient:
     """ERPNext API Client"""
 
-    def __init__(self, url, username, password, company_abbr=None):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
-        # Use provided abbreviation or auto-detect
-        if company_abbr:
-            self.company_abbr = company_abbr
-            self.company_name = self._get_company_name_by_abbr(company_abbr)
-        else:
-            self.company_name, self.company_abbr = self._get_company_info()
+        self.headers = {
+            'Authorization': f'token {api_key}:{api_secret}',
+            'Content-Type': 'application/json'
+        }
+        self._verify_connection()
+        self.company_name, self.company_abbr = self._get_company_info()
         print(f'Using company: {self.company_name} (abbr: {self.company_abbr})')
 
-    def _get_company_name_by_abbr(self, abbr):
-        """Get company name by abbreviation"""
+    def _verify_connection(self):
+        """Verify API connection works"""
         response = self.session.get(
-            f'{self.url}/api/resource/Company',
-            params={
-                'filters': json.dumps([['abbr', '=', abbr]]),
-                'limit_page_length': 1
-            },
+            f'{self.url}/api/method/frappe.auth.get_logged_user',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
-        if response.status_code == 200:
-            companies = response.json().get('data', [])
-            if companies:
-                return companies[0]['name']
-        # Fall back to just getting first company
-        return self._get_company_info()[0]
+        if response.status_code != 200:
+            raise Exception(f'API connection failed: {response.status_code}')
+        user = response.json().get('message', 'Unknown')
+        print(f'Connected to ERPNext at {self.url} as {user}')
 
     def _get_company_info(self):
         """Get the first company's name and abbreviation"""
         response = self.session.get(
             f'{self.url}/api/resource/Company',
             params={'limit_page_length': 1},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
@@ -160,9 +152,9 @@ class ERPNextClient:
 
         company_name = companies[0]['name']
 
-        # Get full company details for abbreviation
         response = self.session.get(
             f'{self.url}/api/resource/Company/{company_name}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
@@ -170,32 +162,6 @@ class ERPNextClient:
 
         company_data = response.json().get('data', {})
         return company_data.get('name'), company_data.get('abbr', 'SBS')
-
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
-            timeout=REQUEST_TIMEOUT
-        )
-        if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
-
-    def get_item(self, item_code):
-        """Get an Item by code with valuation_rate"""
-        response = self.session.get(
-            f'{self.url}/api/resource/Item/{item_code}',
-            timeout=REQUEST_TIMEOUT
-        )
-        if response.status_code == 200:
-            try:
-                return response.json().get('data')
-            except json.JSONDecodeError:
-                return None
-        return None
 
     def get_items_batch(self, item_codes, batch_size=100):
         """Fetch multiple items in batches and return a dict of {item_code: item_data}"""
@@ -213,6 +179,7 @@ class ERPNextClient:
                     'fields': fields,
                     'limit_page_length': batch_size
                 },
+                headers=self.headers,
                 timeout=REQUEST_TIMEOUT
             )
 
@@ -226,56 +193,17 @@ class ERPNextClient:
 
         return all_items
 
-    def get_existing_stock_entries(self, posting_date, entry_type='Material Receipt'):
-        """Get existing Stock Entries for a date to prevent duplicates.
-        Returns a set of warehouse names that already have entries."""
-        filters = json.dumps([
-            ['stock_entry_type', '=', entry_type],
-            ['posting_date', '=', posting_date],
-            ['docstatus', '!=', 2]  # Exclude cancelled
-        ])
-
-        response = self.session.get(
-            f'{self.url}/api/resource/Stock Entry',
-            params={
-                'filters': filters,
-                'fields': json.dumps(['name']),
-                'limit_page_length': 500
-            },
-            timeout=REQUEST_TIMEOUT
-        )
-
-        existing_warehouses = set()
-        if response.status_code == 200:
-            try:
-                entries = response.json().get('data', [])
-                # For each entry, get the warehouses used
-                for entry in entries:
-                    entry_detail = self.session.get(
-                        f'{self.url}/api/resource/Stock Entry/{entry["name"]}',
-                        timeout=REQUEST_TIMEOUT
-                    )
-                    if entry_detail.status_code == 200:
-                        items = entry_detail.json().get('data', {}).get('items', [])
-                        for item in items:
-                            if item.get('t_warehouse'):
-                                existing_warehouses.add(item['t_warehouse'])
-            except json.JSONDecodeError:
-                pass
-
-        return existing_warehouses
-
     def warehouse_exists(self, warehouse_name):
         """Check if warehouse exists"""
         response = self.session.get(
             f'{self.url}/api/resource/Warehouse/{warehouse_name}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         return response.status_code == 200
 
     def create_warehouse(self, warehouse_name):
         """Create a new warehouse"""
-        # Extract base warehouse name by removing company suffix
         suffix = f' - {self.company_abbr}'
         base_name = warehouse_name.replace(suffix, '') if warehouse_name.endswith(suffix) else warehouse_name
         data = {
@@ -286,11 +214,15 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Warehouse',
             json=data,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
+            try:
+                error_data = response.json()
+                return {'error': error_data.get('exception', f'HTTP {response.status_code}')}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}'}
         try:
             return response.json()
         except json.JSONDecodeError:
@@ -300,33 +232,16 @@ class ERPNextClient:
         """Check if Stock Entry Type exists"""
         response = self.session.get(
             f'{self.url}/api/resource/Stock Entry Type/{entry_type}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         return response.status_code == 200
-
-    def create_stock_entry_type(self, entry_type, purpose):
-        """Create a Stock Entry Type"""
-        data = {
-            'name': entry_type,
-            'purpose': purpose
-        }
-        response = self.session.post(
-            f'{self.url}/api/resource/Stock Entry Type',
-            json=data,
-            headers={'Content-Type': 'application/json'},
-            timeout=REQUEST_TIMEOUT
-        )
-        if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
-        try:
-            return response.json()
-        except json.JSONDecodeError:
-            return {'error': 'Invalid JSON response'}
 
     def fiscal_year_exists(self, year):
         """Check if Fiscal Year exists"""
         response = self.session.get(
             f'{self.url}/api/resource/Fiscal Year/{year}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         return response.status_code == 200
@@ -342,11 +257,15 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Fiscal Year',
             json=data,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
+            try:
+                error_data = response.json()
+                return {'error': error_data.get('exception', f'HTTP {response.status_code}')}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}'}
         try:
             return response.json()
         except json.JSONDecodeError:
@@ -364,11 +283,15 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Stock Entry',
             json=data,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
+            try:
+                error_data = response.json()
+                return {'error': error_data.get('exception', error_data.get('message', f'HTTP {response.status_code}'))}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}'}
         try:
             return response.json()
         except json.JSONDecodeError:
@@ -376,9 +299,9 @@ class ERPNextClient:
 
     def submit_stock_entry(self, stock_entry_name):
         """Submit a Stock Entry to make it effective"""
-        # First get the document fresh
         response = self.session.get(
             f'{self.url}/api/resource/Stock Entry/{stock_entry_name}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
@@ -389,18 +312,20 @@ class ERPNextClient:
         except json.JSONDecodeError:
             return {'error': 'Invalid JSON response on get'}
 
-        # Submit using the proper API
         response = self.session.post(
             f'{self.url}/api/method/frappe.client.submit',
             json={'doc': doc},
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
-            return {'error': f'HTTP {response.status_code}'}
+            try:
+                error_data = response.json()
+                return {'error': error_data.get('exception', f'HTTP {response.status_code}')}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}'}
         try:
             result = response.json()
-            # Check if submitted successfully
             if result.get('message', {}).get('docstatus') == 1:
                 return {'data': result.get('message')}
             return {'error': 'Submit did not return docstatus=1'}
@@ -443,7 +368,6 @@ def clean_float(value):
     """Convert string to float"""
     if not value:
         return 0.0
-    # Remove currency symbols and commas
     cleaned = re.sub(r'[£$€,]', '', str(value).strip())
     try:
         return float(cleaned)
@@ -460,11 +384,9 @@ def resolve_warehouse(location, company_abbr):
 
     location = location.strip().upper()
 
-    # Check direct mapping
     if location in WAREHOUSE_BASE_MAPPING:
         return WAREHOUSE_BASE_MAPPING[location] + suffix
 
-    # Try to find partial match
     for sheet_loc, erp_wh_base in WAREHOUSE_BASE_MAPPING.items():
         if sheet_loc in location or location in sheet_loc:
             return erp_wh_base + suffix
@@ -473,16 +395,16 @@ def resolve_warehouse(location, company_abbr):
 
 
 def read_inventory(service, spreadsheet_id, company_abbr):
-    """Read inventory data from Google Sheets
+    """Read inventory data from Google Sheets.
 
-    Columns:
-    - Col 2 (C): SBS SKU - item_code
-    - Col 11 (L): REMAINING QTY - available stock
-    - Col 13 (N): CURRENT LOCATION - warehouse
+    Columns (0-indexed):
+    - C (2):  SBS SKU - item_code
+    - L (11): REMAINING QTY - available stock
+    - N (13): CURRENT LOCATION - warehouse
     """
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
-        range='Inventory!A2:O5000'  # Start from row 2 (skip header)
+        range='Inventory!A2:O5000'
     ).execute()
 
     rows = result.get('values', [])
@@ -493,26 +415,26 @@ def read_inventory(service, spreadsheet_id, company_abbr):
         def get_col(idx):
             return row[idx] if idx < len(row) else ''
 
-        sku = clean_text(get_col(2))  # Col C: SBS SKU
-        remaining_qty = clean_float(get_col(11))  # Col L: REMAINING QTY
-        location = clean_text(get_col(13))  # Col N: CURRENT LOCATION
+        sku = clean_text(get_col(2))           # Col C: SBS SKU
+        qty = clean_float(get_col(11))         # Col L: REMAINING QTY
+        location = clean_text(get_col(13))     # Col N: CURRENT LOCATION
 
-        # Skip rows without SKU or with zero/negative stock
         if not sku:
             continue
 
-        if remaining_qty <= 0:
+        if qty <= 0:
             skipped.append({
                 'sku': sku,
-                'reason': f'Zero or negative stock: {remaining_qty}'
+                'qty': qty,
+                'reason': f'Zero or negative remaining qty: {qty}'
             })
             continue
 
         inventory.append({
             'item_code': sku,
-            'qty': remaining_qty,
+            'qty': qty,
             'location': location,
-            'warehouse': resolve_warehouse(location, company_abbr)
+            'warehouse': resolve_warehouse(location, company_abbr),
         })
 
     return inventory, skipped
@@ -541,16 +463,8 @@ def ensure_stock_entry_type(client):
     if client.stock_entry_type_exists(entry_type):
         print(f'   Stock Entry Type "{entry_type}" exists')
         return True
-
-    print(f'   Creating Stock Entry Type "{entry_type}"...')
-    response = client.create_stock_entry_type(entry_type, entry_type)
-    if response.get('data', {}).get('name'):
-        print(f'   Created Stock Entry Type "{entry_type}"')
-        return True
-    else:
-        error = response.get('error', 'Unknown error')
-        print(f'   ERROR: Failed to create Stock Entry Type: {error}')
-        return False
+    print(f'   ERROR: Stock Entry Type "{entry_type}" does not exist')
+    return False
 
 
 def ensure_warehouses(client, inventory):
@@ -573,23 +487,14 @@ def ensure_warehouses(client, inventory):
                 failed.append({'warehouse': wh, 'error': error})
                 print(f'   ERROR: Failed to create {wh}: {error}')
 
-    return {
-        'created': created,
-        'existing': existing,
-        'failed': failed
-    }
+    return {'created': created, 'existing': existing, 'failed': failed}
 
 
 def create_stock_entries(client, inventory, batch_size=100):
-    """Create Stock Entries grouped by warehouse
-
-    Creates one Stock Entry per warehouse with all items for that warehouse.
-    Skips warehouses that already have Stock Entries for the posting date.
-    """
+    """Create Stock Entries grouped by warehouse."""
     results = {
         'entries_created': 0,
         'entries_submitted': 0,
-        'entries_skipped': 0,
         'total_items': 0,
         'items_failed': 0,
         'items_missing': [],
@@ -598,36 +503,21 @@ def create_stock_entries(client, inventory, batch_size=100):
 
     posting_date = datetime.now().strftime('%Y-%m-%d')
 
-    # Check for existing Stock Entries to prevent duplicates
-    print('   Checking for existing Stock Entries...')
-    existing_warehouses = client.get_existing_stock_entries(posting_date)
-    if existing_warehouses:
-        print(f'   Found {len(existing_warehouses)} warehouses with existing entries (will skip)')
-
-    # Group items by warehouse
     by_warehouse = defaultdict(list)
     for item in inventory:
         by_warehouse[item['warehouse']].append(item)
 
     total_warehouses = len(by_warehouse)
 
-    # Pre-fetch all item valuation rates in batches (performance optimization)
     print('   Pre-fetching item valuation rates...')
     all_item_codes = list(set(item['item_code'] for item in inventory))
     item_data_map = client.get_items_batch(all_item_codes)
-    print(f'   Fetched {len(item_data_map)} items')
+    print(f'   Fetched {len(item_data_map)} items from ERPNext')
 
     for wh_idx, (warehouse, items) in enumerate(sorted(by_warehouse.items()), 1):
         print(f'\n[{wh_idx}/{total_warehouses}] Processing warehouse: {warehouse}')
         print(f'   Items to process: {len(items)}')
 
-        # Skip if warehouse already has Stock Entry for this date
-        if warehouse in existing_warehouses:
-            print(f'   SKIPPED: Stock Entry already exists for {posting_date}')
-            results['entries_skipped'] += 1
-            continue
-
-        # Prepare items with valuation rates (using pre-fetched data)
         stock_items = []
         for item in items:
             item_data = item_data_map.get(item['item_code'])
@@ -647,7 +537,6 @@ def create_stock_entries(client, inventory, batch_size=100):
                 't_warehouse': warehouse
             }
 
-            # Allow zero valuation rate if no rate is available
             if valuation_rate <= 0:
                 stock_item['allow_zero_valuation_rate'] = 1
 
@@ -657,7 +546,6 @@ def create_stock_entries(client, inventory, batch_size=100):
             print(f'   No valid items for warehouse {warehouse}')
             continue
 
-        # Split into batches if too many items
         for batch_start in range(0, len(stock_items), batch_size):
             batch_items = stock_items[batch_start:batch_start + batch_size]
             batch_num = (batch_start // batch_size) + 1
@@ -677,7 +565,6 @@ def create_stock_entries(client, inventory, batch_size=100):
                     results['total_items'] += len(batch_items)
                     print(f'   Created: {entry_name}')
 
-                    # Submit the Stock Entry
                     submit_response = client.submit_stock_entry(entry_name)
                     if submit_response.get('data', {}).get('docstatus') == 1:
                         results['entries_submitted'] += 1
@@ -686,7 +573,7 @@ def create_stock_entries(client, inventory, batch_size=100):
                         error = submit_response.get('error', 'Unknown error')
                         print(f'   WARNING: Created but failed to submit: {error}')
                 else:
-                    error = response.get('exception') or response.get('message') or response.get('error') or 'Unknown error'
+                    error = response.get('error', 'Unknown error')
                     results['errors'].append({
                         'warehouse': warehouse,
                         'error': str(error)[:200]
@@ -694,20 +581,13 @@ def create_stock_entries(client, inventory, batch_size=100):
                     print(f'   ERROR: Failed to create Stock Entry: {str(error)[:100]}')
 
             except requests.exceptions.Timeout:
-                results['errors'].append({
-                    'warehouse': warehouse,
-                    'error': 'Request timeout'
-                })
+                results['errors'].append({'warehouse': warehouse, 'error': 'Request timeout'})
                 print(f'   ERROR: Timeout for warehouse {warehouse}')
 
             except requests.exceptions.RequestException as e:
-                results['errors'].append({
-                    'warehouse': warehouse,
-                    'error': f'Network error: {type(e).__name__}'
-                })
+                results['errors'].append({'warehouse': warehouse, 'error': f'Network error: {type(e).__name__}'})
                 print(f'   ERROR: Network error for {warehouse}: {type(e).__name__}')
 
-            # Rate limiting
             time.sleep(1)
 
     return results
@@ -716,7 +596,7 @@ def create_stock_entries(client, inventory, batch_size=100):
 def main():
     """Main migration function"""
     print('=' * 60)
-    print('SBS-52: Inventory Migration')
+    print('SBS-64: Inventory Migration (REMAINING QTY)')
     print('=' * 60)
 
     config = get_config()
@@ -724,28 +604,26 @@ def main():
     print('\n1. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
-        config['erpnext']['username'],
-        config['erpnext']['password'],
-        config['erpnext']['company_abbr']
+        config['erpnext']['api_key'],
+        config['erpnext']['api_secret']
     )
 
     print('\n2. Connecting to Google Sheets...')
     sheets_service = get_sheets_service(config)
 
-    print('\n3. Reading Inventory sheet...')
+    print('\n3. Reading Inventory sheet (REMAINING QTY column)...')
     inventory, skipped = read_inventory(
         sheets_service,
         config['google_sheets']['spreadsheet_id'],
         erpnext.company_abbr
     )
-    print(f'   Found {len(inventory)} items with stock')
-    print(f'   Skipped {len(skipped)} items (zero/negative stock)')
+    print(f'   Found {len(inventory)} items with positive remaining qty')
+    print(f'   Skipped {len(skipped)} items (zero/negative qty)')
 
     if not inventory:
         print('\nNo inventory items to import. Exiting.')
         sys.exit(0)
 
-    # Show warehouse distribution
     warehouse_counts = defaultdict(int)
     for item in inventory:
         warehouse_counts[item['warehouse']] += 1
@@ -753,7 +631,6 @@ def main():
     for wh, count in sorted(warehouse_counts.items()):
         print(f'      {wh}: {count} items')
 
-    # Get current year for Fiscal Year
     current_year = datetime.now().strftime('%Y')
 
     print(f'\n4. Ensuring Fiscal Year {current_year} exists...')
@@ -781,7 +658,6 @@ def main():
     print('=' * 60)
     print(f'Stock Entries Created:   {results["entries_created"]}')
     print(f'Stock Entries Submitted: {results["entries_submitted"]}')
-    print(f'Stock Entries Skipped:   {results["entries_skipped"]} (already exist)')
     print(f'Total Items Imported:    {results["total_items"]}')
     print(f'Items Failed:            {results["items_failed"]}')
 
@@ -797,18 +673,17 @@ def main():
         for err in results['errors'][:10]:
             print(f'  - {err["warehouse"]}: {err["error"][:80]}')
 
-    # Save report
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     report_path = os.path.join(tempfile.gettempdir(), f'inventory_migration_report_{timestamp}.json')
     with open(report_path, 'w') as f:
         json.dump({
             'timestamp': timestamp,
+            'source_column': 'REMAINING QTY (col L)',
             'total_inventory_items': len(inventory),
             'skipped_items': len(skipped),
             'warehouse_results': wh_results,
             'entries_created': results['entries_created'],
             'entries_submitted': results['entries_submitted'],
-            'entries_skipped': results['entries_skipped'],
             'total_items_imported': results['total_items'],
             'items_failed': results['items_failed'],
             'items_missing': results['items_missing'],
@@ -816,7 +691,6 @@ def main():
         }, f, indent=2)
     print(f'\nDetailed report saved to: {report_path}')
 
-    # Exit with error code if any failures
     has_errors = results['items_failed'] > 0 or len(results['errors']) > 0
     sys.exit(1 if has_errors else 0)
 
