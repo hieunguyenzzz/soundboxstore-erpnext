@@ -64,14 +64,23 @@ python scripts/migrate.py
 python scripts/migrate.py --dry-run
 
 # Clear all transactional data (keep master data)
-python scripts/clear_data.py
+python scripts/clear.py
 
 # Clear everything including master data
-python scripts/clear_data.py --scope all
+python scripts/clear.py --scope all
 
 # Preview clear without executing
-python scripts/clear_data.py --dry-run
+python scripts/clear.py --dry-run
 ```
+
+## Script Naming Convention
+
+| Prefix | Purpose | Examples |
+|--------|---------|----------|
+| (none) | Entry points | `migrate.py`, `clear.py` |
+| `migrate_` | Migration modules | `migrate_customers.py`, `migrate_sales_orders.py` |
+| `setup_` | One-time setup | `setup_custom_fields.py`, `setup_warehouses.py` |
+| `ops_` | Operations/maintenance | `ops_validate.py`, `ops_reconcile.py` |
 
 ### Migration Steps (in order)
 1. `master_data` - Products/Items
