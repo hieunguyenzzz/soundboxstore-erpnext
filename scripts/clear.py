@@ -32,6 +32,7 @@ SQL_TRANSACTIONS = [
     "TRUNCATE TABLE `tabSales Invoice Item`",
     "TRUNCATE TABLE `tabPurchase Invoice Item`",
     "TRUNCATE TABLE `tabStock Reconciliation Item`",
+    "TRUNCATE TABLE `tabPayment Entry Reference`",
 
     # 3. Transaction parent tables
     "TRUNCATE TABLE `tabDelivery Note`",
@@ -42,6 +43,7 @@ SQL_TRANSACTIONS = [
     "TRUNCATE TABLE `tabPurchase Order`",
     "TRUNCATE TABLE `tabStock Entry`",
     "TRUNCATE TABLE `tabStock Reconciliation`",
+    "TRUNCATE TABLE `tabPayment Entry`",
 
     # 4. Custom DocTypes
     "TRUNCATE TABLE `tabContainer Pre-Allocation`",

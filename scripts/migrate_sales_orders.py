@@ -49,25 +49,37 @@ BATCH_SIZE = 50
 SHEETS = {
     'sales': {
         'name': 'Sales',
-        'range': 'Sales!A2:Z5000',
+        'range': 'Sales!A2:AM5000',  # Extended to include Column AG (Payment Terms)
         'submit_so': True,
         'stock_status': 'FOR MANUFACTURE',  # New orders, items not ordered yet
-        'create_delivery_note': False
+        'create_delivery_note': False,
+        # Column mapping
+        'col_payment_terms': 32,  # Column AG - PAYMENT TERMS
+        'col_order_amount': 18,   # Column S - Amount (different meaning in Sales)
+        'default_payment_terms': None  # No default, use sheet value
     },
     'for_despatch': {
         'name': 'For Despatch',
         'range': 'For Despatch!A2:AM5000',  # Extended to include Column AL (DPS DATE)
         'submit_so': True,
         'stock_status': 'FOR DESPATCH',  # Items in stock, ready to ship
-        'create_delivery_note': False
+        'create_delivery_note': False,
+        # Column mapping
+        'col_payment_terms': 32,  # Column AG - PAYMENT TERMS
+        'col_order_amount': 18,   # Column S - Amount
+        'default_payment_terms': None
     },
     'despatched': {
         'name': 'Despatched',
-        'range': 'Despatched!A2:Z10000',
+        'range': 'Despatched!A2:AM10000',
         'submit_so': True,
         'stock_status': 'DESPATCHED',  # Already delivered
         'create_delivery_note': True,
-        'submit_delivery_note': True  # User chose to submit DNs
+        'submit_delivery_note': True,
+        # Column mapping - Despatched has different structure
+        'col_payment_terms': None,  # No Payment Terms column in Despatched sheet
+        'col_order_amount': 18,     # Column S - Amount
+        'default_payment_terms': 'FULLY PAID'  # Assume all despatched orders are paid
     }
 }
 
@@ -371,6 +383,85 @@ class ERPNextClient:
             return response.json().get('data')
         return None
 
+    def get_item_rate(self, item_code):
+        """Get item standard_rate from cache or fetch it"""
+        item = self.get_item(item_code)
+        if item:
+            return item.get('standard_rate') or item.get('valuation_rate') or 0
+        return 0
+
+    def get_default_mode_of_payment(self):
+        """Get the first available Mode of Payment"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Mode of Payment',
+            params={'limit_page_length': 1},
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            if data:
+                return data[0]['name']
+        # Default to Bank Transfer if none found
+        return 'Bank Transfer'
+
+    def create_payment_entry(self, data):
+        """Create a Payment Entry in ERPNext"""
+        response = self.session.post(
+            f'{self.url}/api/resource/Payment Entry',
+            json=data,
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code not in (200, 201):
+            try:
+                err = response.json()
+                return {'error': err.get('exception', err.get('message', f'HTTP {response.status_code}'))}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}: {response.text[:200]}'}
+        return response.json()
+
+    def get_company_default_account(self, account_type):
+        """Get default account for the company"""
+        response = self.session.get(
+            f'{self.url}/api/resource/Company/{self.company_name}',
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            company = response.json().get('data', {})
+            if account_type == 'receivable':
+                return company.get('default_receivable_account')
+            elif account_type == 'bank':
+                bank = company.get('default_bank_account')
+                if bank:
+                    return bank
+                # Fallback: find a Cash or Bank account
+                return self._find_bank_or_cash_account()
+        return None
+
+    def _find_bank_or_cash_account(self):
+        """Find first available Bank or Cash leaf account (not a group)"""
+        # Find a Cash or Bank account that is NOT a group
+        response = self.session.get(
+            f'{self.url}/api/resource/Account',
+            params={
+                'filters': json.dumps([
+                    ['account_type', 'in', ['Cash', 'Bank']],
+                    ['company', '=', self.company_name],
+                    ['is_group', '=', 0]  # Must be a leaf account, not a group
+                ]),
+                'limit_page_length': 1
+            },
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            if data:
+                return data[0]['name']
+        return f'Cash - {self.company_abbr}'
+
 
 def get_sheets_service(config):
     """Initialize Google Sheets API service"""
@@ -443,6 +534,19 @@ def parse_qty(value):
         return 0
 
 
+def clean_price(value):
+    """Parse price/currency from string like '£1,234.56' or '1234.56'"""
+    if not value:
+        return 0.0
+    # Remove currency symbols and whitespace
+    cleaned = str(value).strip()
+    cleaned = cleaned.replace('£', '').replace('$', '').replace('€', '').replace(',', '').strip()
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def read_orders_from_sheet(service, spreadsheet_id, sheet_config):
     """Read and parse orders from a Google Sheet.
 
@@ -488,6 +592,8 @@ def read_orders_from_sheet(service, spreadsheet_id, sheet_config):
         'container': '',
         'eta': None,
         'dps_date': None,  # DPS DATE from Column AL - target dispatch date for For Despatch orders
+        'payment_terms': '',  # Column AG - FULLY PAID, BEFORE DELIVERY, AFTER DELIVERY
+        'order_amount': 0.0,  # Column S - Order Amount (currency)
         'source_sheet': sheet_config['name']
     })
 
@@ -526,10 +632,28 @@ def read_orders_from_sheet(service, spreadsheet_id, sheet_config):
             order['container'] = clean_text(get_col(21))  # Column V
         if not order['eta']:
             order['eta'] = parse_date(get_col(22))  # Column W
+        # Date delivered - Column X for Sales/For Despatch (index 23), Column AH for Despatched (index 33)
         if not order['date_delivered']:
-            order['date_delivered'] = parse_date(get_col(23))  # Column X
+            # For Despatched sheet, date_delivered is in Column AH (index 33)
+            if sheet_config['name'] == 'Despatched':
+                order['date_delivered'] = parse_date(get_col(33))  # Column AH - Date Delivered
+            else:
+                order['date_delivered'] = parse_date(get_col(23))  # Column X
         if not order['dps_date']:
             order['dps_date'] = parse_date(get_col(37))  # Column AL - DPS DATE (target dispatch date)
+
+        # Payment terms - use sheet-specific column or default
+        if not order['payment_terms']:
+            col_payment_terms = sheet_config.get('col_payment_terms')
+            if col_payment_terms is not None:
+                order['payment_terms'] = clean_text(get_col(col_payment_terms)).upper()
+            elif sheet_config.get('default_payment_terms'):
+                order['payment_terms'] = sheet_config.get('default_payment_terms')
+
+        # Order amount - use sheet-specific column
+        if order['order_amount'] == 0.0:
+            col_order_amount = sheet_config.get('col_order_amount', 18)
+            order['order_amount'] = clean_price(get_col(col_order_amount))
 
         # Line item
         sku = clean_text(get_col(15))  # Column P - SKU
@@ -546,14 +670,173 @@ def read_orders_from_sheet(service, spreadsheet_id, sheet_config):
     return dict(orders)
 
 
+def calculate_order_amount(items, client):
+    """Calculate order amount from item quantities and rates"""
+    total = 0.0
+    for item in items:
+        rate = client.get_item_rate(item['item_code'])
+        total += item['qty'] * rate
+    return total
+
+
+def get_payment_posting_date(payment_terms, order_date, delivery_date):
+    """
+    Calculate the posting date for Payment Entry based on payment terms.
+
+    Returns:
+        str: YYYY-MM-DD format date, or None if can't determine
+    """
+    if not payment_terms:
+        return None
+
+    payment_terms = payment_terms.upper().strip()
+
+    if payment_terms == 'FULLY PAID':
+        # Payment made at order time
+        return order_date
+
+    elif payment_terms == 'BEFORE DELIVERY':
+        # Payment made 1 day before delivery
+        if not delivery_date:
+            return None
+        try:
+            dt = datetime.strptime(delivery_date, '%Y-%m-%d')
+            return (dt - timedelta(days=1)).strftime('%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+
+    elif payment_terms == 'AFTER DELIVERY':
+        # Payment made 1 day after delivery
+        if not delivery_date:
+            return None
+        try:
+            dt = datetime.strptime(delivery_date, '%Y-%m-%d')
+            return (dt + timedelta(days=1)).strftime('%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+
+    return None
+
+
+def create_payment_entry_for_order(client, so_name, customer_id, amount, posting_date, results):
+    """Create a Payment Entry for a Sales Order.
+
+    Uses the Sales Order's actual grand_total from ERPNext to ensure the payment
+    amount matches the outstanding amount exactly.
+    """
+    if not posting_date:
+        return None
+
+    # Get the actual Sales Order total from ERPNext
+    so_data = client.get_sales_order(so_name)
+    if not so_data:
+        results['pe_skipped'].append({
+            'so_name': so_name,
+            'reason': 'Could not fetch Sales Order'
+        })
+        return None
+
+    # Use rounded_total (preferred) or grand_total from ERPNext
+    # ERPNext Payment Entry uses rounded_total for outstanding calculations
+    payment_amount = so_data.get('rounded_total') or so_data.get('grand_total') or 0
+    if payment_amount <= 0:
+        results['pe_skipped'].append({
+            'so_name': so_name,
+            'reason': f'Sales Order amount is {payment_amount}'
+        })
+        return None
+
+    # Get required accounts
+    receivable_account = client.get_company_default_account('receivable')
+    bank_account = client.get_company_default_account('bank')
+    mode_of_payment = client.get_default_mode_of_payment()
+
+    if not receivable_account:
+        results['pe_skipped'].append({
+            'so_name': so_name,
+            'reason': 'No receivable account configured'
+        })
+        return None
+
+    pe_data = {
+        'doctype': 'Payment Entry',
+        'naming_series': 'ACC-PAY-.YYYY.-',
+        'payment_type': 'Receive',
+        'company': client.company_name,
+        'mode_of_payment': mode_of_payment,
+        'party_type': 'Customer',
+        'party': customer_id,
+        'paid_amount': payment_amount,
+        'received_amount': payment_amount,
+        'posting_date': posting_date,
+        'reference_no': so_name,
+        'reference_date': posting_date,
+        'paid_to': bank_account or receivable_account,
+        'paid_from': receivable_account,
+        'references': [{
+            'reference_doctype': 'Sales Order',
+            'reference_name': so_name,
+            'allocated_amount': payment_amount
+        }]
+    }
+
+    response = client.create_payment_entry(pe_data)
+
+    if response.get('data', {}).get('name'):
+        pe_name = response['data']['name']
+        results['pe_created'] += 1
+
+        # Submit the Payment Entry
+        submit_response = client.submit_document('Payment Entry', pe_name)
+        if submit_response.get('error'):
+            results['pe_submit_failed'].append({
+                'pe_name': pe_name,
+                'error': submit_response['error'][:100]
+            })
+        else:
+            results['pe_submitted'] += 1
+
+        return pe_name
+    else:
+        error = response.get('error', 'Unknown error')
+        results['pe_create_failed'].append({
+            'so_name': so_name,
+            'error': str(error)[:150]
+        })
+        return None
+
+
 def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, default_warehouse, results):
-    """Create a single Sales Order in ERPNext"""
+    """Create a single Sales Order in ERPNext.
+
+    Returns:
+        dict: {
+            'so_name': str,
+            'customer_id': str,
+            'amount': float,
+            'order_date': str,
+            'delivery_date': str,
+            'payment_terms': str,
+            'skipped': bool
+        }
+    """
+    result_data = {
+        'so_name': None,
+        'customer_id': None,
+        'amount': 0.0,
+        'order_date': None,
+        'delivery_date': None,
+        'payment_terms': order_data.get('payment_terms', ''),
+        'skipped': False
+    }
 
     # Check if SO already exists
     existing_so = client.find_sales_order_by_po_no(order_no)
     if existing_so:
         results['skipped'] += 1
-        return existing_so  # Return existing SO for DN creation
+        result_data['so_name'] = existing_so
+        result_data['skipped'] = True
+        return result_data
 
     # Find customer
     customer_id = client.get_customer(order_data['customer_name'])
@@ -562,10 +845,13 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
             'order_no': order_no,
             'customer': order_data['customer_name']
         })
-        return None
+        return result_data
+
+    result_data['customer_id'] = customer_id
 
     # Verify all items exist
     items_data = []
+    calculated_amount = 0.0
     for item in order_data['items']:
         item_data = client.get_item(item['item_code'])
         if not item_data:
@@ -575,17 +861,25 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
             })
             continue
 
+        rate = item_data.get('standard_rate') or item_data.get('valuation_rate') or 0
         items_data.append({
             'item_code': item_data['name'],
             'item_name': item['item_name'] or item_data.get('item_name', item_data['name']),
             'qty': item['qty'],
-            'rate': item_data.get('standard_rate') or 0,
+            'rate': rate,
             'warehouse': default_warehouse
         })
+        calculated_amount += item['qty'] * rate
 
     if not items_data:
         results['no_valid_items'].append(order_no)
-        return None
+        return result_data
+
+    # Determine order amount: use Column S if available, otherwise calculated
+    order_amount = order_data.get('order_amount', 0.0)
+    if order_amount <= 0:
+        order_amount = calculated_amount
+    result_data['amount'] = order_amount
 
     # Resolve container
     container_link = None
@@ -594,6 +888,7 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
 
     # Calculate dates
     transaction_date = order_data['order_date'] or datetime.now().strftime('%Y-%m-%d')
+    result_data['order_date'] = transaction_date
 
     # Delivery date priority:
     # 1. date_delivered (for DESPATCHED orders - actual delivery)
@@ -606,6 +901,8 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
     if delivery_date and delivery_date <= transaction_date:
         trans_dt = datetime.strptime(transaction_date, '%Y-%m-%d')
         delivery_date = (trans_dt + timedelta(days=1)).strftime('%Y-%m-%d')
+
+    result_data['delivery_date'] = delivery_date
 
     # Build Sales Order data
     so_data = {
@@ -639,6 +936,7 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
 
     if response.get('data', {}).get('name'):
         so_name = response['data']['name']
+        result_data['so_name'] = so_name
         results['created'] += 1
 
         # Submit if configured
@@ -653,14 +951,14 @@ def create_sales_order_in_erpnext(client, order_no, order_data, sheet_config, de
             else:
                 results['submitted'] += 1
 
-        return so_name
+        return result_data
     else:
         error = response.get('error', 'Unknown error')
         results['create_failed'].append({
             'order_no': order_no,
             'error': str(error)[:150]
         })
-        return None
+        return result_data
 
 
 def create_delivery_note_for_order(client, so_name, order_data, default_warehouse, sheet_config, results):
@@ -691,8 +989,15 @@ def create_delivery_note_for_order(client, so_name, order_data, default_warehous
     if not dn_items:
         return None
 
-    # Use date_delivered if available, otherwise order_date
-    posting_date = order_data['date_delivered'] or order_data['order_date'] or datetime.now().strftime('%Y-%m-%d')
+    # Use Sales Order's custom_date_delivered (set during SO creation from Google Sheets)
+    # This ensures DN posting_date matches the actual historical delivery date
+    posting_date = so.get('custom_date_delivered') or so.get('transaction_date')
+    if not posting_date:
+        results['dn_create_failed'].append({
+            'so_name': so_name,
+            'error': 'No delivery date available'
+        })
+        return None
 
     dn_data = {
         'doctype': 'Delivery Note',
@@ -746,7 +1051,13 @@ def process_sheet(client, service, spreadsheet_id, sheet_key, sheet_config, defa
         'dn_created': 0,
         'dn_submitted': 0,
         'dn_create_failed': [],
-        'dn_submit_failed': []
+        'dn_submit_failed': [],
+        # Payment Entry tracking
+        'pe_created': 0,
+        'pe_submitted': 0,
+        'pe_create_failed': [],
+        'pe_submit_failed': [],
+        'pe_skipped': []
     }
 
     print(f'\n   Reading from {sheet_config["name"]} sheet...')
@@ -762,14 +1073,45 @@ def process_sheet(client, service, spreadsheet_id, sheet_key, sheet_config, defa
     total = len(orders)
     for i, (order_no, order_data) in enumerate(orders.items()):
         try:
-            so_name = create_sales_order_in_erpnext(
+            so_result = create_sales_order_in_erpnext(
                 client, order_no, order_data, sheet_config, default_warehouse, results
             )
+
+            so_name = so_result.get('so_name') if so_result else None
 
             if so_name and sheet_config.get('create_delivery_note', False):
                 create_delivery_note_for_order(
                     client, so_name, order_data, default_warehouse, sheet_config, results
                 )
+
+            # Create Payment Entry if conditions are met
+            # Only for newly created orders (not skipped), with valid payment terms
+            if so_result and so_result.get('so_name') and not so_result.get('skipped'):
+                payment_terms = so_result.get('payment_terms', '')
+                order_date = so_result.get('order_date')
+                delivery_date = so_result.get('delivery_date')
+                customer_id = so_result.get('customer_id')
+
+                # Calculate payment posting date
+                payment_posting_date = get_payment_posting_date(
+                    payment_terms, order_date, delivery_date
+                )
+
+                if payment_posting_date and customer_id:
+                    create_payment_entry_for_order(
+                        client,
+                        so_result['so_name'],
+                        customer_id,
+                        None,  # Amount will be fetched from SO grand_total
+                        payment_posting_date,
+                        results
+                    )
+                elif payment_terms:
+                    # Log skipped payment entries
+                    results['pe_skipped'].append({
+                        'so_name': so_result['so_name'],
+                        'reason': f'Cannot calculate posting date for {payment_terms}'
+                    })
 
             if (i + 1) % 10 == 0:
                 print(f'   Processed {i+1}/{total} orders from {sheet_config["name"]}')
@@ -850,6 +1192,8 @@ def main():
     total_skipped = sum(r['skipped'] for r in all_results)
     total_dn_created = sum(r['dn_created'] for r in all_results)
     total_dn_submitted = sum(r['dn_submitted'] for r in all_results)
+    total_pe_created = sum(r['pe_created'] for r in all_results)
+    total_pe_submitted = sum(r['pe_submitted'] for r in all_results)
 
     print(f'\nOrders Read:      {total_read}')
     print(f'SO Created:       {total_created}')
@@ -857,16 +1201,22 @@ def main():
     print(f'SO Skipped:       {total_skipped} (already exist)')
     print(f'DN Created:       {total_dn_created}')
     print(f'DN Submitted:     {total_dn_submitted}')
+    print(f'PE Created:       {total_pe_created}')
+    print(f'PE Submitted:     {total_pe_submitted}')
 
     # Errors summary
     all_customer_not_found = []
     all_item_not_found = []
     all_create_failed = []
+    all_pe_create_failed = []
+    all_pe_skipped = []
 
     for r in all_results:
         all_customer_not_found.extend(r['customer_not_found'])
         all_item_not_found.extend(r['item_not_found'])
         all_create_failed.extend(r['create_failed'])
+        all_pe_create_failed.extend(r['pe_create_failed'])
+        all_pe_skipped.extend(r['pe_skipped'])
 
     if all_customer_not_found:
         unique_customers = set(c['customer'] for c in all_customer_not_found)
@@ -881,9 +1231,23 @@ def main():
             print(f'  - {i}')
 
     if all_create_failed:
-        print(f'\nCreate failures: {len(all_create_failed)}')
+        print(f'\nSO Create failures: {len(all_create_failed)}')
         for f in all_create_failed[:5]:
             print(f'  - {f["order_no"]}: {f["error"][:60]}')
+
+    if all_pe_create_failed:
+        print(f'\nPE Create failures: {len(all_pe_create_failed)}')
+        for f in all_pe_create_failed[:5]:
+            print(f'  - {f["so_name"]}: {f["error"][:60]}')
+
+    if all_pe_skipped:
+        print(f'\nPE Skipped: {len(all_pe_skipped)}')
+        reasons = {}
+        for s in all_pe_skipped:
+            reason = s.get('reason', 'Unknown')
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for reason, count in list(reasons.items())[:5]:
+            print(f'  - {reason}: {count}')
 
     # Save detailed report
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -897,6 +1261,8 @@ def main():
             'total_so_skipped': total_skipped,
             'total_dn_created': total_dn_created,
             'total_dn_submitted': total_dn_submitted,
+            'total_pe_created': total_pe_created,
+            'total_pe_submitted': total_pe_submitted,
             'sheet_results': all_results
         }, f, indent=2)
     print(f'\nDetailed report saved to: {report_path}')
