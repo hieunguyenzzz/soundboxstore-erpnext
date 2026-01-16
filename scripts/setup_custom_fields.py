@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SBS-53: Custom Fields Setup Script
+SBS-64: Custom Fields Setup Script
 Creates custom fields for Item, Purchase Order, and Sales Order doctypes in ERPNext.
 
 This script:
@@ -8,11 +8,12 @@ This script:
 2. Creates custom fields on Item, Purchase Order, and Sales Order doctypes
 3. Sets up Link fields to Container and Warehouse doctypes
 4. Configures fetch fields for automatic ETA population
+5. Adds custom_stock_status for order lifecycle tracking
 
 Environment Variables:
-  ERPNEXT_URL      - ERPNext server URL (required)
-  ERPNEXT_USERNAME - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD - ERPNext password (required)
+  ERPNEXT_URL        - ERPNext server URL (required)
+  ERPNEXT_API_KEY    - ERPNext API key (required)
+  ERPNEXT_API_SECRET - ERPNext API secret (required)
 
 Usage:
   python scripts/setup_custom_fields.py
@@ -50,7 +51,7 @@ ITEM_FIELDS = [
         "fieldtype": "Select",
         "label": "Category",
         "insert_after": "custom_sku",
-        "options": "\nFurniture\nAccessory\nLighting\nOther",
+        "options": "\nBooth\nAcoustic Panel\nAcoustic Slat\nFurniture\nAccessory\nMoss\nSpare Glass\nSpare Packaging",
         "in_list_view": 1,
         "in_standard_filter": 1,
         "description": "Product category"
@@ -131,6 +132,18 @@ PURCHASE_ORDER_FIELDS = [
 ]
 
 SALES_ORDER_FIELDS = [
+    # Stock Status field - critical for order lifecycle tracking
+    {
+        "dt": "Sales Order",
+        "fieldname": "custom_stock_status",
+        "fieldtype": "Select",
+        "label": "Stock Status",
+        "insert_after": "status",
+        "options": "\nFOR MANUFACTURE\nSTOCK COMING\nFOR DESPATCH\nDESPATCHED",
+        "in_list_view": 1,
+        "in_standard_filter": 1,
+        "description": "Stock availability status for this order"
+    },
     # Section break for Order Notes
     {
         "dt": "Sales Order",
@@ -186,10 +199,10 @@ SALES_ORDER_FIELDS = [
     {
         "dt": "Sales Order",
         "fieldname": "custom_booked_to_warehouse",
-        "fieldtype": "Data",
+        "fieldtype": "Date",
         "label": "Booked to Warehouse",
         "insert_after": "custom_warehouse_section",
-        "description": "Warehouse notes for delivery"
+        "description": "Date stock was received at warehouse"
     },
     {
         "dt": "Sales Order",
@@ -199,6 +212,15 @@ SALES_ORDER_FIELDS = [
         "insert_after": "custom_booked_to_warehouse",
         "description": "D&I Notes for warehouse team"
     },
+    # Delivery tracking
+    {
+        "dt": "Sales Order",
+        "fieldname": "custom_date_delivered",
+        "fieldtype": "Date",
+        "label": "Date Delivered",
+        "insert_after": "custom_warehouse_notes",
+        "description": "Actual delivery date to customer"
+    },
 ]
 
 
@@ -206,23 +228,24 @@ def get_config():
     """Load configuration from environment variables"""
     config = {
         'url': os.environ.get('ERPNEXT_URL'),
-        'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-        'password': os.environ.get('ERPNEXT_PASSWORD'),
+        'api_key': os.environ.get('ERPNEXT_API_KEY'),
+        'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
     }
 
     missing = []
     if not config['url']:
         missing.append('ERPNEXT_URL')
-    if not config['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
 
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("\nRequired environment variables:")
-        print("  ERPNEXT_URL      - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD - ERPNext admin password")
-        print("\nOptional:")
-        print("  ERPNEXT_USERNAME - ERPNext username (default: Administrator)")
+        print("  ERPNEXT_URL        - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
+        print("  ERPNEXT_API_KEY    - ERPNext API key")
+        print("  ERPNEXT_API_SECRET - ERPNext API secret")
         sys.exit(1)
 
     return config
@@ -246,23 +269,26 @@ def create_session_with_retry():
 class ERPNextClient:
     """ERPNext API Client"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
+        self.headers = {
+            'Authorization': f'token {api_key}:{api_secret}',
+            'Content-Type': 'application/json'
+        }
+        self._verify_connection()
 
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
+    def _verify_connection(self):
+        """Verify API connection works"""
+        response = self.session.get(
+            f'{self.url}/api/method/frappe.auth.get_logged_user',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
+            raise Exception(f'API connection failed: {response.status_code}')
+        user = response.json().get('message', 'Unknown')
+        print(f'Connected to ERPNext at {self.url} as {user}')
 
     def custom_field_exists(self, dt, fieldname):
         """Check if a custom field exists"""
@@ -270,6 +296,7 @@ class ERPNextClient:
         name = f"{dt}-{fieldname}"
         response = self.session.get(
             f'{self.url}/api/resource/Custom Field/{name}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         return response.status_code == 200
@@ -279,7 +306,7 @@ class ERPNextClient:
         response = self.session.post(
             f'{self.url}/api/resource/Custom Field',
             json=field_def,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
@@ -298,6 +325,7 @@ class ERPNextClient:
         name = f"{dt}-{fieldname}"
         response = self.session.get(
             f'{self.url}/api/resource/Custom Field/{name}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code == 200:
@@ -306,6 +334,26 @@ class ERPNextClient:
             except json.JSONDecodeError:
                 return None
         return None
+
+    def update_custom_field(self, dt, fieldname, updates):
+        """Update an existing custom field"""
+        name = f"{dt}-{fieldname}"
+        response = self.session.put(
+            f'{self.url}/api/resource/Custom Field/{name}',
+            json=updates,
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT
+        )
+        if response.status_code not in (200, 201):
+            try:
+                error_data = response.json()
+                return {'error': error_data.get('exception', error_data.get('message', f'HTTP {response.status_code}'))}
+            except json.JSONDecodeError:
+                return {'error': f'HTTP {response.status_code}'}
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            return {'error': 'Invalid JSON response'}
 
 
 def setup_fields(client, fields, doctype_name):
@@ -354,8 +402,8 @@ def main():
     print('\n1. Connecting to ERPNext...')
     client = ERPNextClient(
         config['url'],
-        config['username'],
-        config['password']
+        config['api_key'],
+        config['api_secret']
     )
 
     print('\n2. Creating custom fields...')

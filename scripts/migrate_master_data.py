@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-SBS-51: Master Data Migration Script
+SBS-64: Master Data Migration Script
 Imports products from Google Sheets Masterfile into ERPNext
+
+This script:
+1. Reads product data from Masterfile sheet
+2. Maps categories properly to both item_group and custom_category
+3. Creates/updates Items with all custom fields
 
 Environment Variables:
   ERPNEXT_URL          - ERPNext server URL (required)
-  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)
-  ERPNEXT_PASSWORD     - ERPNext password (required)
+  ERPNEXT_API_KEY      - ERPNext API key (required)
+  ERPNEXT_API_SECRET   - ERPNext API secret (required)
   GOOGLE_SHEETS_CREDS  - Path to service account JSON OR the JSON content itself
   SPREADSHEET_ID       - Google Sheets spreadsheet ID (optional, has default)
 """
@@ -37,8 +42,8 @@ def get_config():
     config = {
         'erpnext': {
             'url': os.environ.get('ERPNEXT_URL'),
-            'username': os.environ.get('ERPNEXT_USERNAME', 'Administrator'),
-            'password': os.environ.get('ERPNEXT_PASSWORD'),
+            'api_key': os.environ.get('ERPNEXT_API_KEY'),
+            'api_secret': os.environ.get('ERPNEXT_API_SECRET'),
         },
         'google_sheets': {
             'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly'],
@@ -47,23 +52,24 @@ def get_config():
         }
     }
 
-    # Validate required config
     missing = []
     if not config['erpnext']['url']:
         missing.append('ERPNEXT_URL')
-    if not config['erpnext']['password']:
-        missing.append('ERPNEXT_PASSWORD')
+    if not config['erpnext']['api_key']:
+        missing.append('ERPNEXT_API_KEY')
+    if not config['erpnext']['api_secret']:
+        missing.append('ERPNEXT_API_SECRET')
     if not config['google_sheets']['credentials']:
         missing.append('GOOGLE_SHEETS_CREDS')
 
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("\nRequired environment variables:")
-        print("  ERPNEXT_URL          - ERPNext server URL (e.g., https://erp.soundboxstore.com)")
-        print("  ERPNEXT_PASSWORD     - ERPNext admin password")
-        print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON file OR JSON content")
+        print("  ERPNEXT_URL          - ERPNext server URL")
+        print("  ERPNEXT_API_KEY      - ERPNext API key")
+        print("  ERPNEXT_API_SECRET   - ERPNext API secret")
+        print("  GOOGLE_SHEETS_CREDS  - Path to service account JSON OR JSON content")
         print("\nOptional:")
-        print("  ERPNEXT_USERNAME     - ERPNext username (default: Administrator)")
         print("  SPREADSHEET_ID       - Google Sheets ID (has default)")
         sys.exit(1)
 
@@ -86,32 +92,35 @@ def create_session_with_retry():
 
 
 class ERPNextClient:
-    """ERPNext API Client"""
+    """ERPNext API Client using token authentication"""
 
-    def __init__(self, url, username, password):
+    def __init__(self, url, api_key, api_secret):
         self.url = url.rstrip('/')
         self.session = create_session_with_retry()
-        self.login(username, password)
+        self.headers = {
+            'Authorization': f'token {api_key}:{api_secret}',
+            'Content-Type': 'application/json'
+        }
+        self._verify_connection()
 
-    def login(self, username, password):
-        """Login and get session cookie"""
-        response = self.session.post(
-            f'{self.url}/api/method/login',
-            data={'usr': username, 'pwd': password},
+    def _verify_connection(self):
+        """Verify API connection works"""
+        response = self.session.get(
+            f'{self.url}/api/method/frappe.auth.get_logged_user',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code != 200:
-            raise Exception(f'Login failed with status {response.status_code}')
-        if 'Logged In' not in response.text:
-            raise Exception('Login failed: Invalid credentials')
-        print(f'Logged in to ERPNext at {self.url}')
+            raise Exception(f'API connection failed: {response.status_code}')
+        user = response.json().get('message', 'Unknown')
+        print(f'Connected to ERPNext at {self.url} as {user}')
 
     def create_item(self, data):
         """Create an Item in ERPNext"""
         response = self.session.post(
             f'{self.url}/api/resource/Item',
             json=data,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
@@ -125,6 +134,7 @@ class ERPNextClient:
         """Get an Item by code"""
         response = self.session.get(
             f'{self.url}/api/resource/Item/{item_code}',
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code == 200:
@@ -139,7 +149,7 @@ class ERPNextClient:
         response = self.session.put(
             f'{self.url}/api/resource/Item/{item_code}',
             json=data,
-            headers={'Content-Type': 'application/json'},
+            headers=self.headers,
             timeout=REQUEST_TIMEOUT
         )
         if response.status_code not in (200, 201):
@@ -219,7 +229,22 @@ def clean_text(value):
 
 
 def read_masterfile(service, spreadsheet_id):
-    """Read and parse Masterfile sheet"""
+    """Read and parse Masterfile sheet
+
+    Column mapping (0-indexed, starting from row 9):
+    A (0):  SBS SKU - item_code
+    C (2):  Item Name - item_name
+    D (3):  Description - description
+    F (5):  Finish - custom_finish
+    G (6):  Cost (Valuation) - valuation_rate
+    H (7):  Selling Price - standard_rate
+    I (8):  CBM - custom_unit_cbm
+    R (17): Category - item_group (fallback)
+    AH (33): Packing Size - custom_packing_size
+    AL (37): Weight - weight_per_unit
+    AT (45): Supplier SKU - (metadata)
+    AU (46): Category - primary category
+    """
     result = service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id,
         range='Masterfile!A9:AU5000'
@@ -228,6 +253,7 @@ def read_masterfile(service, spreadsheet_id):
     rows = result.get('values', [])
     items = []
     skipped = []
+    category_counts = {}
 
     for i, row in enumerate(rows):
         if not row or not row[0] or not row[0].strip():
@@ -243,9 +269,14 @@ def read_masterfile(service, spreadsheet_id):
             skipped.append(f'Row {i+9}: Missing SKU or name')
             continue
 
-        category = clean_text(get_col(46))
-        if category not in VALID_ITEM_GROUPS:
-            category = 'Booth'
+        # Try primary category column (AU), fallback to R column
+        raw_category = clean_text(get_col(46)) or clean_text(get_col(17))
+
+        # Normalize category to match ERPNext Item Groups
+        category = normalize_category(raw_category)
+
+        # Track category distribution
+        category_counts[category] = category_counts.get(category, 0) + 1
 
         weight = clean_float(get_col(37))
 
@@ -259,7 +290,9 @@ def read_masterfile(service, spreadsheet_id):
             'include_item_in_manufacturing': 0,
             'valuation_rate': clean_price(get_col(6)),
             'standard_rate': clean_price(get_col(7)),
-            'custom_cbm': clean_float(get_col(8)),
+            'custom_sku': sku,
+            'custom_category': category,  # Also set custom_category field
+            'custom_unit_cbm': clean_float(get_col(8)),
             'custom_finish': clean_text(get_col(5)),
             'custom_packing_size': clean_text(get_col(33)),
         }
@@ -274,7 +307,51 @@ def read_masterfile(service, spreadsheet_id):
 
         items.append(item)
 
+    # Print category distribution
+    print('   Category distribution:')
+    for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+        print(f'      {cat}: {count}')
+
     return items, skipped
+
+
+def normalize_category(raw_category):
+    """Normalize category string to match ERPNext Item Groups"""
+    if not raw_category:
+        return 'Furniture'  # Default
+
+    # Map various spellings to standard categories
+    category_map = {
+        'BOOTH': 'Booth',
+        'BOOTHS': 'Booth',
+        'ACOUSTIC PANEL': 'Acoustic Panel',
+        'ACOUSTIC PANELS': 'Acoustic Panel',
+        'PANEL': 'Acoustic Panel',
+        'ACOUSTIC SLAT': 'Acoustic Slat',
+        'ACOUSTIC SLATS': 'Acoustic Slat',
+        'SLAT': 'Acoustic Slat',
+        'FURNITURE': 'Furniture',
+        'ACCESSORY': 'Accessory',
+        'ACCESSORIES': 'Accessory',
+        'MOSS': 'Moss',
+        'SPARE GLASS': 'Spare Glass',
+        'GLASS': 'Spare Glass',
+        'SPARE PACKAGING': 'Spare Packaging',
+        'PACKAGING': 'Spare Packaging',
+    }
+
+    # Try exact match (case-insensitive)
+    upper = raw_category.upper().strip()
+    if upper in category_map:
+        return category_map[upper]
+
+    # Try partial match
+    for key, value in category_map.items():
+        if key in upper:
+            return value
+
+    # Default to Furniture if no match
+    return 'Furniture'
 
 
 def has_changes(existing, new_data, fields):
@@ -313,7 +390,7 @@ def import_items(client, items, batch_size=50):
     # Fields to compare for changes
     compare_fields = [
         'item_name', 'description', 'item_group', 'valuation_rate', 'standard_rate',
-        'custom_cbm', 'custom_finish', 'custom_packing_size', 'weight_per_unit'
+        'custom_category', 'custom_unit_cbm', 'custom_finish', 'custom_packing_size', 'weight_per_unit'
     ]
 
     total = len(items)
@@ -393,10 +470,9 @@ def import_items(client, items, batch_size=50):
 def main():
     """Main migration function"""
     print('=' * 60)
-    print('SBS-51: Master Data Migration')
+    print('SBS-64: Master Data Migration')
     print('=' * 60)
 
-    # Load configuration
     config = get_config()
 
     print('\n1. Connecting to Google Sheets...')
@@ -405,8 +481,8 @@ def main():
     print('\n2. Connecting to ERPNext...')
     erpnext = ERPNextClient(
         config['erpnext']['url'],
-        config['erpnext']['username'],
-        config['erpnext']['password']
+        config['erpnext']['api_key'],
+        config['erpnext']['api_secret']
     )
 
     print('\n3. Reading Masterfile from Google Sheets...')
