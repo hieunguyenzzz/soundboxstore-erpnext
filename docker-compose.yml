@@ -1,5 +1,5 @@
 x-backend-defaults: &backend_defaults
-  image: frappe/erpnext:${ERPNEXT_VERSION:-v15}
+  image: frappe/erpnext:${ERPNEXT_VERSION:-v16.37.0}
   volumes:
     - sites:/home/frappe/frappe-bench/sites
     - logs:/home/frappe/frappe-bench/logs
@@ -9,7 +9,7 @@ x-backend-defaults: &backend_defaults
 
 services:
   configurator:
-    image: frappe/erpnext:${ERPNEXT_VERSION:-v15}
+    image: frappe/erpnext:${ERPNEXT_VERSION:-v16.37.0}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
       - logs:/home/frappe/frappe-bench/logs
@@ -87,7 +87,7 @@ services:
       - schedule
 
   db:
-    image: mariadb:10.6
+    image: mariadb:11.8
     restart: unless-stopped
     command:
       - --character-set-server=utf8mb4
@@ -96,10 +96,11 @@ services:
       - --skip-innodb-read-only-compressed
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1"
     volumes:
       - db-data:/var/lib/mysql
     healthcheck:
-      test: mysqladmin ping -h localhost --password=${DB_PASSWORD}
+      test: mariadb-admin ping -h 127.0.0.1 --password=${DB_PASSWORD}
       interval: 1s
       retries: 20
 
@@ -140,11 +141,16 @@ services:
     profiles:
       - setup
 
+# Explicit names so the data never depends on the Compose project/directory name
 volumes:
   db-data:
+    name: sbs-erpnext-db-data
   redis-queue-data:
+    name: sbs-erpnext-redis-queue-data
   sites:
+    name: sbs-erpnext-sites
   logs:
+    name: sbs-erpnext-logs
 
 networks:
   dokploy-network:
