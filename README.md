@@ -4,8 +4,8 @@ ERPNext deployment for Soundbox inventory management.
 
 ## Stack
 
-- ERPNext v15
-- MariaDB 10.6
+- ERPNext v16 (Frappe v16)
+- MariaDB 11.8
 - Redis (cache + queue)
 - Nginx
 
