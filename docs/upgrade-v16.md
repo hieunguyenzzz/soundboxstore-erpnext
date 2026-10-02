@@ -24,34 +24,65 @@ and a `localhost` (socket) ping reports healthy while the real server is still a
 
 ## Production steps (OVH, `ssh debian@139.99.9.132`)
 
+Dokploy settings (read via `compose.one`, composeId `2JPiergVusPdel0d9EoPa`, 2026-10-02):
+`isolatedDeployment: false`, `randomize: false`, `isolatedDeploymentsVolume: false`, `suffix: ""`,
+`autoDeploy: true` on `main`. So the pinned `sbs-erpnext-*` volume names are used as written (no suffixing).
+
+### Before merging
+
 1. **Backup** (done 2026-10-02): cold tars of `code_db-data` and `code_sites` with `SHA256SUMS` in
    `/home/debian/backups/erpnext-2026-10-02/`.
 2. **Copy the data into the new volume names** (cold; nothing mounts `code_*`). The `code_*` volumes are
-   never written and stay as the rollback.
+   never written and stay as the rollback. Refuse to copy over an existing target, so an empty datadir
+   from a stray deploy never gets mixed with the 10.6 files:
    ```bash
    for v in db-data sites logs redis-queue-data; do
-     sudo docker ps -a --filter volume=code_$v --format '{{.Names}}'   # must print nothing
+     [ -z "$(sudo docker ps -aq --filter volume=code_$v)" ] || { echo "code_$v is mounted"; exit 1; }
+     sudo docker volume inspect sbs-erpnext-$v >/dev/null 2>&1 && { echo "sbs-erpnext-$v exists"; exit 1; }
      sudo docker volume create sbs-erpnext-$v
      sudo docker run --rm -v code_$v:/from:ro -v sbs-erpnext-$v:/to alpine cp -a /from/. /to/
    done
    ```
-   Compose warns that the volumes "were not created by Docker Compose"; that is expected and harmless.
-3. **Dokploy env**: set `ERPNEXT_VERSION=v16.37.0` (or delete the variable). The current `v15` value
-   overrides the compose default.
-4. **Merge the PR** — Dokploy auto-deploys `main`.
-5. **Migrate** once the db container is `healthy` (backend is `<app>-backend-1`):
+   Compose later warns these volumes "were not created by Docker Compose"; expected and harmless.
+3. **Keep v16 workers/scheduler off the v15 schema until migrate**: set `maintenance_mode` and
+   `pause_scheduler` in the copied site config (the desk answers 503 meanwhile):
    ```bash
-   B=$(sudo docker ps --format '{{.Names}}' | grep compose-synthesize-redundant-bus-lmvxll-backend)
+   sudo docker run --rm --entrypoint bash -v sbs-erpnext-sites:/home/frappe/frappe-bench/sites frappe/erpnext:v16.37.0 -c \
+     'cd sites/erp.soundboxstore.com && jq ". + {maintenance_mode: 1, pause_scheduler: 1}" site_config.json > /tmp/sc && cat /tmp/sc > site_config.json'
+   ```
+4. **Dokploy env**: set `ERPNEXT_VERSION=v16.37.0` (or delete the variable); the current `v15` overrides
+   the compose default. Keep `DB_PASSWORD` as is: it is the datadir's root password (the local rehearsal
+   used exactly this value for root against the copied datadir).
+
+### Merge, then migrate
+
+5. **Merge the PR**; Dokploy auto-deploys `main`.
+6. **Check the db mounts the right volume and has finished auto-upgrading.** Don't rely on `healthy`
+   (1s x 20 retries may be too short during the upgrade); wait for the real server on port 3306:
+   ```bash
+   P=compose-synthesize-redundant-bus-lmvxll
+   DB=$(sudo docker ps --format '{{.Names}}' | grep "^$P-db-")
+   sudo docker inspect $DB --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{println}}{{end}}'  # sbs-erpnext-db-data -> /var/lib/mysql
+   until sudo docker logs $DB 2>&1 | grep -q "Finished mariadb-upgrade" && sudo docker logs $DB 2>&1 | grep -q "ready for connections" && sudo docker logs $DB 2>&1 | grep -q "port: 3306"; do sleep 2; done
+   ```
+7. **Migrate, then lift the flags**:
+   ```bash
+   B=$(sudo docker ps --format '{{.Names}}' | grep "^$P-backend-")
    sudo docker exec $B bench --site erp.soundboxstore.com migrate     # ~2 min locally, 122 patches
    sudo docker exec $B bench --site erp.soundboxstore.com clear-cache
-   sudo docker restart $(sudo docker ps --format '{{.Names}}' | grep -E 'compose-synthesize-redundant-bus-lmvxll-(backend|websocket|queue|scheduler|frontend)')
+   sudo docker exec $B bench --site erp.soundboxstore.com set-maintenance-mode off
+   sudo docker exec $B bench --site erp.soundboxstore.com scheduler resume
+   sudo docker restart $(sudo docker ps --format '{{.Names}}' | grep -E "^$P-(backend|websocket|queue|scheduler|frontend)")
    sudo docker exec $B bench --site erp.soundboxstore.com backup --with-files
    ```
-6. **Verify**: `https://erp.soundboxstore.com/api/method/ping` returns 200, desk loads, record counts match
-   the baseline below.
+8. **Verify**: `https://erp.soundboxstore.com/api/method/ping` returns 200, desk loads, record counts match
+   the baseline below, Scheduled Job Log shows new `Complete` rows.
 
 Expected non-fatal migrate output: `Error in setting standard field Could not find Row #1: Link To: Payments`
 (caught inside `add_standard_field_in_workspace_sidebar`; the patch reports Success).
+
+Steps 2-3 and 6-7 were rehearsed locally on a fresh restore: no scheduled jobs ran while paused, desk
+returned 503, migrate exited 0, counts matched, jobs resumed after `scheduler resume`.
 
 ## Baseline (cold copy, verified before and after the local upgrade)
 
@@ -62,13 +93,16 @@ and `UTM Campaign-crm_campaign`).
 
 ## Rollback
 
-MariaDB 11.8 upgrades the datadir in place, so the `sbs-erpnext-*` volumes cannot go back to 10.6.
-Roll back from the untouched `code_*` volumes instead:
+Rollback **discards anything entered in v16 after cutover**: MariaDB 11.8 upgrades the datadir in place,
+so the `sbs-erpnext-*` volumes cannot go back to 10.6, and the data comes back from the untouched `code_*` volumes.
 
 1. Stop the stack in Dokploy.
-2. `sudo docker volume rm sbs-erpnext-db-data sbs-erpnext-sites` (other two optional), then repeat step 2 above.
-3. Deploy a commit with `frappe/erpnext:v15.94.3`, `mariadb:10.6` and the pinned `sbs-erpnext-*` volume names
-   (revert only the image/MariaDB lines), and set `ERPNEXT_VERSION=v15.94.3` in Dokploy.
+2. Open a new PR/commit to `main` (it auto-deploys when merged) that reverts the image default to
+   `frappe/erpnext:v15.94.3`, `mariadb:10.6`, drops `MARIADB_AUTO_UPGRADE` (keep the pinned volume names and
+   the healthcheck can go back to `mysqladmin`). Set Dokploy `ERPNEXT_VERSION=v15.94.3`.
+3. Before merging it: `sudo docker volume rm sbs-erpnext-db-data sbs-erpnext-sites sbs-erpnext-logs sbs-erpnext-redis-queue-data`,
+   then recreate them from `code_*` with step 2 above (skip step 3; v15 needs no flags).
+4. Merge, then verify ping and counts.
 
 ## Local rehearsal
 
