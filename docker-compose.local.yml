@@ -1,14 +1,10 @@
 # Local development compose - extends docker-compose.yml
 # Usage: docker compose -p sbs-erpnext-local -f docker-compose.yml -f docker-compose.local.yml up -d
 # Serves the restored prod site (erp.soundboxstore.com) at http://sbserp.loc via traefik-local.
-# Unique container names keep BACKEND/SOCKETIO from resolving to other stacks on local-dev.
 # Note: v16 socket.io rejects Host != site name ("Invalid origin"), so realtime only connects
 # when the browser uses erp.soundboxstore.com; desk and API work fine on sbserp.loc.
 
 services:
-  backend:
-    container_name: sbs-erpnext-backend
-
   frontend:
     labels:
       - "traefik.enable=true"
@@ -18,14 +14,11 @@ services:
       - "traefik.docker.network=local-dev"
     environment:
       FRAPPE_SITE_NAME_HEADER: erp.soundboxstore.com
-      BACKEND: sbs-erpnext-backend:8000
-      SOCKETIO: sbs-erpnext-websocket:9000
     networks:
       - default
       - local-dev
 
   websocket:
-    container_name: sbs-erpnext-websocket
     # socket.io auth calls back to the request Host; reach it via traefik on the host
     extra_hosts:
       - "sbserp.loc:host-gateway"

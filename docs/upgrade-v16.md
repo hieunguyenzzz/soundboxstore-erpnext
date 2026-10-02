@@ -78,6 +78,11 @@ Dokploy settings (read via `compose.one`, composeId `2JPiergVusPdel0d9EoPa`, 202
 8. **Verify**: `https://erp.soundboxstore.com/api/method/ping` returns 200, desk loads, record counts match
    the baseline below, Scheduled Job Log shows new `Complete` rows.
 
+Post-cutover 502 (fixed in the follow-up PR): frontend is on both `default` and `dokploy-network`, and on
+`dokploy-network` the name `backend` also resolves to other stacks' backend services, so nginx's `backend:8000`
+hit the wrong containers. Backend/websocket now carry unique aliases `sbs-erpnext-backend`/`sbs-erpnext-websocket`
+on `default`, and frontend's `BACKEND`/`SOCKETIO` point at those.
+
 Expected non-fatal migrate output: `Error in setting standard field Could not find Row #1: Link To: Payments`
 (caught inside `add_standard_field_in_workspace_sidebar`; the patch reports Success).
 

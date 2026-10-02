@@ -35,6 +35,11 @@ services:
   backend:
     <<: *backend_defaults
     restart: unless-stopped
+    # Unique alias: frontend also sits on dokploy-network, where other stacks' "backend" services resolve too
+    networks:
+      default:
+        aliases:
+          - sbs-erpnext-backend
 
   frontend:
     <<: *backend_defaults
@@ -42,8 +47,8 @@ services:
     command:
       - nginx-entrypoint.sh
     environment:
-      BACKEND: backend:8000
-      SOCKETIO: websocket:9000
+      BACKEND: sbs-erpnext-backend:8000
+      SOCKETIO: sbs-erpnext-websocket:9000
       FRAPPE_SITE_NAME_HEADER: ${SITE_NAME:-erp.soundboxstore.com}
       UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
       UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
@@ -57,6 +62,10 @@ services:
   websocket:
     <<: *backend_defaults
     restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - sbs-erpnext-websocket
     command:
       - node
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
